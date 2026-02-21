@@ -13,11 +13,7 @@ import {
   clearActiveSession,
   sendTtyInput,
 } from './gateway.js';
-
-/** Escape text for safe embedding in Telegram HTML messages. */
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+import { escapeHtml } from './format.js';
 
 function guardUser(ctx: Context, allowedUserId: number): boolean {
   if (ctx.from?.id !== allowedUserId) {
