@@ -47,7 +47,8 @@ export function createBot(token: string, allowedUserId: number): Bot {
         const chunks = splitMessage(text, 4000);
         for (const chunk of chunks) {
           try {
-            await bot.api.sendMessage(chatId, `\`\`\`\n${chunk}\n\`\`\``, { parse_mode: 'Markdown' });
+            const escaped = chunk.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            await bot.api.sendMessage(chatId, `<pre>${escaped}</pre>`, { parse_mode: 'HTML' });
           } catch (err) {
             console.error('[bot] Failed to send TTY output:', err);
           }
