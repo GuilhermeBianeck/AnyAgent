@@ -17,6 +17,8 @@ let activeTerminal: TerminalSession | null = null;
 // Store private key hex for use during pairing flow
 let pendingPrivateKeyHex: string | null = null;
 
+const RECONNECT_DELAY_MS = 5000;
+
 function sendJson(ws: WebSocket, obj: JsonRpcRequest | JsonRpcResponse): void {
   ws.send(JSON.stringify(obj));
 }
@@ -80,7 +82,7 @@ export function connect(hubUrl: string): void {
       activeTerminal.kill();
       activeTerminal = null;
     }
-    setTimeout(() => connect(hubUrl), 5000);
+    setTimeout(() => connect(hubUrl), RECONNECT_DELAY_MS);
   });
 
   ws.on('error', (err) => {

@@ -1,5 +1,6 @@
 import * as pty from 'node-pty';
 import { WebSocket } from 'ws';
+import { homedir } from 'os';
 
 export interface TerminalSession {
   pid: number;
@@ -18,7 +19,7 @@ export function spawnTerminal(
     name: 'xterm-256color',
     cols: 80,
     rows: 24,
-    cwd: process.env.HOME ?? process.cwd(),
+    cwd: process.env.HOME ?? homedir(),
     env: process.env as Record<string, string>,
   });
 

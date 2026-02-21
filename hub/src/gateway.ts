@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
-import { randomBytes, verify as cryptoVerify } from 'crypto';
+import { randomBytes, verify as cryptoVerify, timingSafeEqual } from 'crypto';
 import { Bot } from 'grammy';
 import {
   getPairCode,
@@ -75,7 +75,13 @@ export function createGateway(
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     if (wsSecret) {
       const token = req.headers['x-ws-secret'];
-      if (token !== wsSecret) {
+      const tokenStr = Array.isArray(token) ? token[0] : token;
+      const secretBuf = Buffer.from(wsSecret);
+      const tokenBuf = Buffer.from(tokenStr ?? '');
+      const valid =
+        tokenBuf.length === secretBuf.length &&
+        timingSafeEqual(tokenBuf, secretBuf);
+      if (!valid) {
         ws.close(4401, 'Unauthorized');
         return;
       }
@@ -207,7 +213,8 @@ async function handleMessage(
         session.challenge = undefined;
         nodeMap.set(params.nodeId, connId);
         sendJson(session.ws, makeResult(req.id, { success: true }));
-      } catch (_err) {
+      } catch (err) {
+        console.error('[gateway] Signature verification error:', err);
         sendJson(session.ws, makeError(req.id, -32005, 'Verification failed'));
       }
       break;
