@@ -81,6 +81,23 @@ export interface PairCodeRow {
   ws_id: string;
 }
 
+// Agent registry row
+export interface AgentRow {
+  id: number;
+  name: string;
+  node_id: string;
+  binary: string;
+  args_json: string; // JSON-encoded string[]
+  created_at: string;
+}
+
+// Active session (in-memory)
+export interface ActiveSession {
+  nodeId: string;
+  chatId: number;
+  agentName?: string;
+}
+
 // Pending pair state (in-memory)
 export interface PendingPair {
   wsId: string;
