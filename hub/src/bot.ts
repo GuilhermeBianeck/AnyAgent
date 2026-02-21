@@ -14,6 +14,11 @@ import {
   sendTtyInput,
 } from './gateway.js';
 
+/** Escape text for safe embedding in Telegram HTML messages. */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function guardUser(ctx: Context, allowedUserId: number): boolean {
   if (ctx.from?.id !== allowedUserId) {
     ctx.reply('⛔ Unauthorized').catch(() => {});
@@ -28,6 +33,20 @@ function splitMessage(text: string, maxLen: number): string[] {
     chunks.push(text.slice(i, i + maxLen));
   }
   return chunks.length > 0 ? chunks : [''];
+}
+
+/**
+ * Send a Telegram message with HTML parse mode. If Telegram rejects the HTML,
+ * retry once as plain text (following openclaw's fallback pattern).
+ */
+async function sendHtml(ctx: Context, html: string, extra: Record<string, unknown> = {}): Promise<void> {
+  try {
+    await ctx.reply(html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra });
+  } catch {
+    // Fallback: strip HTML tags and send as plain text
+    const plain = html.replace(/<[^>]*>/g, '');
+    await ctx.reply(plain);
+  }
 }
 
 export function createBot(token: string, allowedUserId: number): Bot {
@@ -47,7 +66,7 @@ export function createBot(token: string, allowedUserId: number): Bot {
         const chunks = splitMessage(text, 4000);
         for (const chunk of chunks) {
           try {
-            const escaped = chunk.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const escaped = escapeHtml(chunk);
             await bot.api.sendMessage(chatId, `<pre>${escaped}</pre>`, { parse_mode: 'HTML' });
           } catch (err) {
             console.error('[bot] Failed to send TTY output:', err);
@@ -73,15 +92,15 @@ export function createBot(token: string, allowedUserId: number): Bot {
 
   bot.command('start', (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    return ctx.reply(
-      'AnyAgent Hub running. Commands:\n' +
-      '/pair - Generate a pairing code for a new worker\n' +
-      '/list - List registered workers\n' +
-      '/agents - List registered agents\n' +
-      '/register <name> <node_id> <binary> [args] - Register an agent\n' +
-      '/unregister <name> - Remove an agent\n' +
-      '/call <agent_name> - Start an agent session\n' +
-      '/stop - Stop the active session\n' +
+    return sendHtml(ctx,
+      '<b>AnyAgent Hub</b> running.\n\n' +
+      '/pair — Generate a pairing code for a new worker\n' +
+      '/list — List registered workers\n' +
+      '/agents — List registered agents\n' +
+      '/register <code>&lt;name&gt; &lt;node_id&gt; &lt;binary&gt; [args]</code> — Register an agent\n' +
+      '/unregister <code>&lt;name&gt;</code> — Remove an agent\n' +
+      '/call <code>&lt;agent_name&gt;</code> — Start an agent session\n' +
+      '/stop — Stop the active session\n\n' +
       'Send plain text to interact with the active session.'
     );
   });
@@ -91,9 +110,7 @@ export function createBot(token: string, allowedUserId: number): Bot {
     const code = randomBytes(3).toString('hex').toUpperCase(); // 6-char hex
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
     insertPairCode(code, expiresAt, '');
-    await ctx.reply(`🔑 Pairing code: \`${code}\`\nExpires in 10 minutes.\nSet PAIR_CODE=${code} on your worker.`, {
-      parse_mode: 'Markdown',
-    });
+    await sendHtml(ctx, `🔑 Pairing code: <code>${escapeHtml(code)}</code>\nExpires in 10 minutes.\nSet <code>PAIR_CODE=${escapeHtml(code)}</code> on your worker.`);
   });
 
   bot.command('list', async (ctx) => {
@@ -105,9 +122,9 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     const lines = nodes.map((n) => {
       const status = isNodeOnline(n.node_id) ? '🟢 online' : '🔴 offline';
-      return `• \`${n.node_id}\` ${status}`;
+      return `• <code>${escapeHtml(n.node_id)}</code> ${status}`;
     });
-    await ctx.reply(`Workers:\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+    await sendHtml(ctx, `<b>Workers:</b>\n${lines.join('\n')}`);
   });
 
   bot.command('call', async (ctx) => {
@@ -123,32 +140,32 @@ export function createBot(token: string, allowedUserId: number): Bot {
     const agent = getAgentByName(args[0]);
     if (agent) {
       if (!isNodeOnline(agent.node_id)) {
-        await ctx.reply(`❌ Agent \`${agent.name}\` is registered on node \`${agent.node_id}\` but the node is offline.`, { parse_mode: 'Markdown' });
+        await sendHtml(ctx, `❌ Agent <code>${escapeHtml(agent.name)}</code> is registered on node <code>${escapeHtml(agent.node_id)}</code> but the node is offline.`);
         return;
       }
       const agentArgs: string[] = JSON.parse(agent.args_json);
       const ok = sendSpawn(agent.node_id, agent.binary, agentArgs);
       if (!ok) {
-        await ctx.reply(`❌ Failed to spawn agent \`${agent.name}\`.`, { parse_mode: 'Markdown' });
+        await sendHtml(ctx, `❌ Failed to spawn agent <code>${escapeHtml(agent.name)}</code>.`);
         return;
       }
       setActiveSession(agent.node_id, ctx.chat!.id, agent.name);
-      await ctx.reply(`✅ Agent \`${agent.name}\` started on \`${agent.node_id}\`.\nSend messages here to interact. Use /stop to end.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `✅ Agent <code>${escapeHtml(agent.name)}</code> started on <code>${escapeHtml(agent.node_id)}</code>.\nSend messages here to interact. Use /stop to end.`);
       return;
     }
 
     // Fallback: treat as node_id + binary
     if (args.length < 2) {
-      await ctx.reply(`❌ Agent \`${args[0]}\` not found. For direct call use: /call <node_id> <binary> [args...]`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(args[0])}</code> not found. For direct call use: /call <code>&lt;node_id&gt; &lt;binary&gt; [args...]</code>`);
       return;
     }
     const [nodeId, binary, ...rest] = args as [string, string, ...string[]];
     const ok = sendSpawn(nodeId, binary, rest);
     if (!ok) {
-      await ctx.reply(`❌ Node \`${nodeId}\` is not online or not found.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `❌ Node <code>${escapeHtml(nodeId)}</code> is not online or not found.`);
     } else {
       setActiveSession(nodeId, ctx.chat!.id);
-      await ctx.reply(`✅ Sent spawn(\`${binary}\`) to \`${nodeId}\`.\nSend messages here to interact. Use /stop to end.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `✅ Sent spawn(<code>${escapeHtml(binary)}</code>) to <code>${escapeHtml(nodeId)}</code>.\nSend messages here to interact. Use /stop to end.`);
     }
   });
 
@@ -165,9 +182,9 @@ export function createBot(token: string, allowedUserId: number): Bot {
       const online = isNodeOnline(a.node_id) ? '🟢' : '🔴';
       const agentArgs: string[] = JSON.parse(a.args_json);
       const argsStr = agentArgs.length > 0 ? ` ${agentArgs.join(' ')}` : '';
-      return `${online} \`${a.name}\` → \`${a.node_id}\` (\`${a.binary}${argsStr}\`)`;
+      return `${online} <code>${escapeHtml(a.name)}</code> → <code>${escapeHtml(a.node_id)}</code> (<code>${escapeHtml(a.binary + argsStr)}</code>)`;
     });
-    await ctx.reply(`Agents:\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+    await sendHtml(ctx, `<b>Agents:</b>\n${lines.join('\n')}`);
   });
 
   bot.command('register', async (ctx) => {
@@ -180,17 +197,17 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     const [name, nodeId, binary, ...rest] = args as [string, string, string, ...string[]];
     if (!nodeExists(nodeId)) {
-      await ctx.reply(`❌ Node \`${nodeId}\` not found. Use /list to see available nodes.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `❌ Node <code>${escapeHtml(nodeId)}</code> not found. Use /list to see available nodes.`);
       return;
     }
     const existing = getAgentByName(name);
     if (existing) {
-      await ctx.reply(`❌ Agent \`${name}\` is already registered. Use /unregister first.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(name)}</code> is already registered. Use /unregister first.`);
       return;
     }
     try {
       insertAgent(name, nodeId, binary, rest);
-      await ctx.reply(`✅ Agent \`${name}\` registered: \`${binary}\` on \`${nodeId}\`.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `✅ Agent <code>${escapeHtml(name)}</code> registered: <code>${escapeHtml(binary)}</code> on <code>${escapeHtml(nodeId)}</code>.`);
     } catch (err) {
       await ctx.reply(`❌ Failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -205,9 +222,9 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     const deleted = deleteAgent(name);
     if (deleted) {
-      await ctx.reply(`✅ Agent \`${name}\` removed.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `✅ Agent <code>${escapeHtml(name)}</code> removed.`);
     } else {
-      await ctx.reply(`❌ Agent \`${name}\` not found.`, { parse_mode: 'Markdown' });
+      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(name)}</code> not found.`);
     }
   });
 
@@ -219,8 +236,8 @@ export function createBot(token: string, allowedUserId: number): Bot {
       return;
     }
     clearActiveSession(session.nodeId);
-    const label = session.agentName ? `Agent \`${session.agentName}\`` : `Session on \`${session.nodeId}\``;
-    await ctx.reply(`🛑 ${label} session ended.`, { parse_mode: 'Markdown' });
+    const label = session.agentName ? `Agent <code>${escapeHtml(session.agentName)}</code>` : `Session on <code>${escapeHtml(session.nodeId)}</code>`;
+    await sendHtml(ctx, `🛑 ${label} session ended.`);
   });
 
   // Inline keyboard callbacks for approve/reject
@@ -232,7 +249,7 @@ export function createBot(token: string, allowedUserId: number): Bot {
       await ctx.answerCallbackQuery({ text: 'Pair request not found or already handled.' });
       return;
     }
-    await ctx.editMessageText(`✅ Approved. Node ID: \`${nodeId}\``, { parse_mode: 'Markdown' });
+    await ctx.editMessageText(`✅ Approved. Node ID: <code>${escapeHtml(nodeId)}</code>`, { parse_mode: 'HTML' });
     await ctx.answerCallbackQuery({ text: `Approved! Node: ${nodeId}` });
   });
 
