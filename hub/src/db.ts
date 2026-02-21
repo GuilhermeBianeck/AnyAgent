@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { NodeRow, PairCodeRow } from './types.js';
+import type { NodeRow, PairCodeRow, AgentRow } from './types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(__dirname, '..', 'data');
@@ -25,6 +25,16 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at TEXT NOT NULL,
     ws_id TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    node_id TEXT NOT NULL,
+    binary TEXT NOT NULL,
+    args_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (node_id) REFERENCES nodes(node_id)
   );
 `);
 
@@ -65,4 +75,24 @@ export function getAllNodes(): NodeRow[] {
 export function nodeExists(nodeId: string): boolean {
   const row = db.prepare(`SELECT id FROM nodes WHERE node_id = ?`).get(nodeId);
   return row !== undefined;
+}
+
+// Agent operations
+export function insertAgent(name: string, nodeId: string, binary: string, args: string[]): void {
+  db.prepare(
+    `INSERT INTO agents (name, node_id, binary, args_json) VALUES (?, ?, ?, ?)`
+  ).run(name, nodeId, binary, JSON.stringify(args));
+}
+
+export function getAgentByName(name: string): AgentRow | undefined {
+  return db.prepare(`SELECT * FROM agents WHERE name = ?`).get(name) as AgentRow | undefined;
+}
+
+export function getAllAgents(): AgentRow[] {
+  return db.prepare(`SELECT * FROM agents`).all() as AgentRow[];
+}
+
+export function deleteAgent(name: string): boolean {
+  const result = db.prepare(`DELETE FROM agents WHERE name = ?`).run(name);
+  return result.changes > 0;
 }

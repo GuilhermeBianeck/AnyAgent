@@ -17,6 +17,7 @@ import type {
   AuthResponseParams,
   SpawnParams,
   PendingPair,
+  ActiveSession,
 } from './types.js';
 
 interface WorkerSession {
@@ -27,9 +28,13 @@ interface WorkerSession {
   challenge?: string;
 }
 
+type TtyCallback = (nodeId: string, data: Buffer) => void;
+
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
 const pendingPairs = new Map<string, PendingPair>();
+const activeSessions = new Map<string, ActiveSession>(); // nodeId → ActiveSession
+let ttyOutputCallback: TtyCallback | null = null;
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -64,6 +69,38 @@ export function sendSpawn(nodeId: string, binary: string, args: string[] = []): 
   return true;
 }
 
+export function setActiveSession(nodeId: string, chatId: number, agentName?: string): void {
+  activeSessions.set(nodeId, { nodeId, chatId, agentName });
+}
+
+export function getActiveSession(nodeId: string): ActiveSession | undefined {
+  return activeSessions.get(nodeId);
+}
+
+export function clearActiveSession(nodeId: string): void {
+  activeSessions.delete(nodeId);
+}
+
+export function getActiveSessionByChatId(chatId: number): ActiveSession | undefined {
+  for (const session of activeSessions.values()) {
+    if (session.chatId === chatId) return session;
+  }
+  return undefined;
+}
+
+export function sendTtyInput(nodeId: string, data: string): boolean {
+  const id = nodeMap.get(nodeId);
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session?.authenticated) return false;
+  session.ws.send(Buffer.from(data), { binary: true });
+  return true;
+}
+
+export function onTtyOutput(callback: TtyCallback): void {
+  ttyOutputCallback = callback;
+}
+
 export function createGateway(
   port: number,
   bot: Bot,
@@ -93,7 +130,11 @@ export function createGateway(
 
     ws.on('message', async (data, isBinary) => {
       if (isBinary) {
-        // Binary frames = TTY data; forward to terminal viewer in future
+        // Binary frames = TTY data; forward to registered callback
+        if (session.nodeId && ttyOutputCallback) {
+          const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+          ttyOutputCallback(session.nodeId, buf);
+        }
         return;
       }
       let rpcReq: JsonRpcRequest;
@@ -221,8 +262,14 @@ async function handleMessage(
     }
 
     case 'spawn_result':
+      console.log(`[gateway] Received ${req.method} from node ${session.nodeId}:`, req.params);
+      break;
+
     case 'exit':
       console.log(`[gateway] Received ${req.method} from node ${session.nodeId}:`, req.params);
+      if (session.nodeId) {
+        activeSessions.delete(session.nodeId);
+      }
       break;
 
     default:

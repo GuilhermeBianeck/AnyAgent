@@ -15,7 +15,8 @@ The central server that:
 - Runs a Telegram bot for operator control
 - Hosts a WebSocket server workers connect to
 - Manages worker pairing, authentication, and session routing
-- Persists worker state in SQLite
+- Persists worker and agent state in SQLite
+- Streams TTY output from agents to Telegram and routes Telegram text as input
 
 ### Worker (`/worker`)
 A CLI agent that:
@@ -23,6 +24,7 @@ A CLI agent that:
 - Authenticates via one-time pairing code or stored Ed25519 key pair
 - Spawns PTY processes (e.g. `bash`, `claude`) on Hub command
 - Streams terminal I/O bidirectionally over WebSocket
+- Auto-reconnects on disconnect (always available)
 
 ## Quick Start
 
@@ -46,6 +48,38 @@ cp .env.example .env
 npm install
 npm run build
 npm start
+```
+
+## Telegram Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Show available commands |
+| `/pair` | Generate a one-time pairing code for a new worker |
+| `/list` | List all registered workers with online/offline status |
+| `/agents` | List all registered agents with their node status |
+| `/register <name> <node_id> <binary> [args...]` | Register a named agent on a worker node |
+| `/unregister <name>` | Remove a registered agent |
+| `/call <agent_name>` | Start an interactive session with a registered agent |
+| `/call <node_id> <binary> [args...]` | Directly spawn a process on a specific worker |
+| `/stop` | End the active agent session |
+
+### Agent Registration Workflow
+
+1. **Pair a worker**: Use `/pair` to get a code, configure the worker, and approve via Telegram
+2. **Register an agent**: `/register claude node_abc123 claude` maps the name "claude" to the `claude` binary on that node
+3. **Call the agent**: `/call claude` spawns the process and connects I/O to Telegram
+4. **Interact**: Send plain text messages to the Telegram chat — they are forwarded as terminal input
+5. **Stop**: Use `/stop` to end the session
+
+### Example: Register Claude CLI
+
+```
+/list                              → see your node IDs
+/register claude node_abc123 claude  → register Claude CLI on that node
+/call claude                        → start interactive session
+Hello, can you help me?             → sent to claude as stdin
+/stop                               → end session
 ```
 
 ## Protocol
