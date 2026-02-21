@@ -39,8 +39,14 @@ async function sendHtml(ctx: Context, html: string, extra: Record<string, unknow
   try {
     await ctx.reply(html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra });
   } catch {
-    // Fallback: strip HTML tags and send as plain text
-    const plain = html.replace(/<[^>]*>/g, '');
+    // Fallback: strip HTML tags and send as plain text.
+    // Loop until stable to handle nested/malformed fragments like <scr<b>ipt>.
+    let plain = html;
+    let prev: string;
+    do {
+      prev = plain;
+      plain = plain.replace(/<[^>]*>/g, '');
+    } while (plain !== prev);
     await ctx.reply(plain);
   }
 }
