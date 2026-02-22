@@ -9,6 +9,7 @@ import {
   insertNode,
   getNodeById,
 } from './db.js';
+import { escapeHtml } from './format.js';
 import type {
   JsonRpcRequest,
   JsonRpcResponse,
@@ -184,9 +185,9 @@ async function handleMessage(
       try {
         await bot.api.sendMessage(
           allowedUserId,
-          `🔗 New worker wants to pair.\nPublic Key: \`${params.publicKey.slice(0, 16)}...\`\nApprove?`,
+          `🔗 New worker wants to pair.\nPublic Key: <code>${escapeHtml(params.publicKey.slice(0, 16))}...</code>\nApprove?`,
           {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [[
                 { text: '✅ Approve', callback_data: `approve:${connId}` },
