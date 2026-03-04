@@ -8,6 +8,10 @@ import {
   deleteExpiredPairCodes,
   insertNode,
   getNodeById,
+  updateNodeName,
+  updateNodeDescription,
+  deleteAgentsByNodeId,
+  upsertAgent,
 } from './db.js';
 import { escapeHtml } from './format.js';
 import type {
@@ -19,6 +23,7 @@ import type {
   SpawnParams,
   PendingPair,
   ActiveSession,
+  DeclareParams,
 } from './types.js';
 
 interface WorkerSession {
@@ -35,6 +40,7 @@ const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
 const pendingPairs = new Map<string, PendingPair>();
 const activeSessions = new Map<string, ActiveSession>(); // nodeId → ActiveSession
+const delegateAgents = new Map<number, string>(); // chatId → agentName
 let ttyOutputCallback: TtyCallback | null = null;
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
@@ -96,6 +102,18 @@ export function sendTtyInput(nodeId: string, data: string): boolean {
   if (!session?.authenticated) return false;
   session.ws.send(Buffer.from(data), { binary: true });
   return true;
+}
+
+export function setDelegateAgent(chatId: number, agentName: string): void {
+  delegateAgents.set(chatId, agentName);
+}
+
+export function getDelegateAgent(chatId: number): string | undefined {
+  return delegateAgents.get(chatId);
+}
+
+export function clearDelegateAgent(chatId: number): void {
+  delegateAgents.delete(chatId);
 }
 
 export function onTtyOutput(callback: TtyCallback): void {
@@ -180,12 +198,21 @@ async function handleMessage(
         sendJson(session.ws, makeError(req.id, -32001, 'Invalid or expired pairing code'));
         return;
       }
-      pendingPairs.set(connId, { wsId: connId, code: params.code, publicKey: params.publicKey });
+      pendingPairs.set(connId, {
+        wsId: connId,
+        code: params.code,
+        publicKey: params.publicKey,
+        name: params.name,
+        description: params.description,
+      });
       deletePairCode(params.code);
+      const workerLabel = params.name
+        ? `<b>${escapeHtml(params.name)}</b>${params.description ? ` — ${escapeHtml(params.description)}` : ''}`
+        : `Public Key: <code>${escapeHtml(params.publicKey.slice(0, 16))}...</code>`;
       try {
         await bot.api.sendMessage(
           allowedUserId,
-          `🔗 New worker wants to pair.\nPublic Key: <code>${escapeHtml(params.publicKey.slice(0, 16))}...</code>\nApprove?`,
+          `🔗 New worker wants to pair.\n${workerLabel}\nApprove?`,
           {
             parse_mode: 'HTML',
             reply_markup: {
@@ -273,6 +300,24 @@ async function handleMessage(
       }
       break;
 
+    case 'declare': {
+      if (!session.authenticated || !session.nodeId) {
+        sendJson(session.ws, makeError(req.id, -32006, 'Not authenticated'));
+        return;
+      }
+      const params = req.params as DeclareParams;
+      if (params.name) updateNodeName(session.nodeId, params.name);
+      if (params.description) updateNodeDescription(session.nodeId, params.description);
+      // Replace all agents for this node
+      deleteAgentsByNodeId(session.nodeId);
+      for (const agent of params.agents ?? []) {
+        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description);
+      }
+      console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s)`);
+      sendJson(session.ws, makeResult(req.id, { success: true }));
+      break;
+    }
+
     default:
       sendJson(session.ws, makeError(req.id, -32601, 'Method not found'));
   }
@@ -283,7 +328,7 @@ export function approvePair(connId: string): string | null {
   if (!pending) return null;
   pendingPairs.delete(connId);
   const nodeId = `node_${randomBytes(4).toString('hex')}`;
-  insertNode(nodeId, pending.publicKey);
+  insertNode(nodeId, pending.publicKey, pending.name, pending.description);
   const session = sessions.get(connId);
   if (session) {
     session.nodeId = nodeId;

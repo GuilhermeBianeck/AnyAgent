@@ -17,6 +17,8 @@ export interface JsonRpcResponse {
 export interface PairParams {
   code: string;
   publicKey: string; // hex-encoded Ed25519 public key (SPKI DER)
+  name?: string;
+  description?: string;
 }
 
 export interface PairResult {
@@ -70,6 +72,7 @@ export interface NodeRow {
   node_id: string;
   public_key: string;
   name: string;
+  description: string;
   approved: number; // 0 or 1
   created_at: string;
 }
@@ -88,6 +91,7 @@ export interface AgentRow {
   node_id: string;
   binary: string;
   args_json: string; // JSON-encoded string[]
+  description: string;
   created_at: string;
 }
 
@@ -103,4 +107,13 @@ export interface PendingPair {
   wsId: string;
   code: string;
   publicKey: string;
+  name?: string;
+  description?: string;
+}
+
+// Worker self-declaration payload
+export interface DeclareParams {
+  name: string;
+  description: string;
+  agents: Array<{ name: string; binary: string; args: string[]; description: string }>;
 }

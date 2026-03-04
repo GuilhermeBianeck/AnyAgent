@@ -16,6 +16,20 @@ export interface JsonRpcResponse {
 export interface PairParams {
   code: string;
   publicKey: string;
+  name?: string;
+  description?: string;
+}
+
+export interface DeclareParams {
+  name: string;
+  description: string;
+  agents: Array<{ name: string; binary: string; args: string[]; description: string }>;
+}
+
+export interface WorkerConfig {
+  name: string;
+  description: string;
+  agents: Array<{ name: string; binary: string; args: string[]; description: string }>;
 }
 
 export interface PairResult {

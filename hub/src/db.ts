@@ -38,6 +38,10 @@ db.exec(`
   );
 `);
 
+// Idempotent migrations: add description columns
+try { db.exec(`ALTER TABLE nodes ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+
 // Pair code operations
 export function insertPairCode(code: string, expiresAt: Date, wsId: string): void {
   db.prepare(
@@ -58,10 +62,18 @@ export function deleteExpiredPairCodes(): void {
 }
 
 // Node operations
-export function insertNode(nodeId: string, publicKey: string): void {
+export function insertNode(nodeId: string, publicKey: string, name?: string, description?: string): void {
   db.prepare(
-    `INSERT INTO nodes (node_id, public_key, approved) VALUES (?, ?, 1)`
-  ).run(nodeId, publicKey);
+    `INSERT INTO nodes (node_id, public_key, name, description, approved) VALUES (?, ?, ?, ?, 1)`
+  ).run(nodeId, publicKey, name ?? '', description ?? '');
+}
+
+export function updateNodeName(nodeId: string, name: string): void {
+  db.prepare(`UPDATE nodes SET name = ? WHERE node_id = ?`).run(name, nodeId);
+}
+
+export function updateNodeDescription(nodeId: string, description: string): void {
+  db.prepare(`UPDATE nodes SET description = ? WHERE node_id = ?`).run(description, nodeId);
 }
 
 export function getNodeById(nodeId: string): NodeRow | undefined {
@@ -78,10 +90,24 @@ export function nodeExists(nodeId: string): boolean {
 }
 
 // Agent operations
-export function insertAgent(name: string, nodeId: string, binary: string, args: string[]): void {
+export function insertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string): void {
   db.prepare(
-    `INSERT INTO agents (name, node_id, binary, args_json) VALUES (?, ?, ?, ?)`
-  ).run(name, nodeId, binary, JSON.stringify(args));
+    `INSERT INTO agents (name, node_id, binary, args_json, description) VALUES (?, ?, ?, ?, ?)`
+  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '');
+}
+
+export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description) VALUES (?, ?, ?, ?, ?)`
+  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '');
+}
+
+export function deleteAgentsByNodeId(nodeId: string): void {
+  db.prepare(`DELETE FROM agents WHERE node_id = ?`).run(nodeId);
+}
+
+export function getAgentsByNodeId(nodeId: string): AgentRow[] {
+  return db.prepare(`SELECT * FROM agents WHERE node_id = ?`).all(nodeId) as AgentRow[];
 }
 
 export function getAgentByName(name: string): AgentRow | undefined {

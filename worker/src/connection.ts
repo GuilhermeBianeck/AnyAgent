@@ -1,5 +1,7 @@
 import { WebSocket } from 'ws';
 import { generateKeyPairSync, sign as cryptoSign } from 'crypto';
+import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { join } from 'path';
 import { spawnTerminal, TerminalSession } from './terminal.js';
 import type {
   JsonRpcRequest,
@@ -10,6 +12,8 @@ import type {
   SpawnParams,
   ResizeParams,
   ExitParams,
+  WorkerConfig,
+  DeclareParams,
 } from './types.js';
 
 // Module-level terminal session so resize handler can access it
@@ -27,7 +31,43 @@ function makeRpc(method: string, params: unknown, id?: number): JsonRpcRequest {
   return { jsonrpc: '2.0', method, params, id };
 }
 
-export function connect(hubUrl: string): void {
+function saveCredentials(nodeId: string, privateKeyHex: string): void {
+  const envPath = join(process.cwd(), '.env');
+  let content = '';
+  if (existsSync(envPath)) {
+    content = readFileSync(envPath, 'utf-8');
+  }
+
+  // Replace or append NODE_ID
+  if (/^NODE_ID=.*/m.test(content)) {
+    content = content.replace(/^NODE_ID=.*/m, `NODE_ID=${nodeId}`);
+  } else {
+    content += `\nNODE_ID=${nodeId}`;
+  }
+
+  // Replace or append PRIVATE_KEY_HEX
+  if (/^PRIVATE_KEY_HEX=.*/m.test(content)) {
+    content = content.replace(/^PRIVATE_KEY_HEX=.*/m, `PRIVATE_KEY_HEX=${privateKeyHex}`);
+  } else {
+    content += `\nPRIVATE_KEY_HEX=${privateKeyHex}`;
+  }
+
+  writeFileSync(envPath, content.replace(/^\n+/, '') + '\n');
+  console.log('[worker] Credentials saved to .env');
+}
+
+function sendDeclare(ws: WebSocket, config: WorkerConfig): void {
+  if (!config.name && config.agents.length === 0) return;
+  const params: DeclareParams = {
+    name: config.name,
+    description: config.description,
+    agents: config.agents,
+  };
+  sendJson(ws, makeRpc('declare', params, 10));
+  console.log(`[worker] Sent declare: ${config.agents.length} agent(s)`);
+}
+
+export function connect(hubUrl: string, config: WorkerConfig): void {
   const ws = new WebSocket(hubUrl);
 
   ws.on('open', () => {
@@ -50,7 +90,12 @@ export function connect(hubUrl: string): void {
       const publicKeyHex = publicKey.export({ type: 'spki', format: 'der' }).toString('hex');
       const privKeyHex = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('hex');
       pendingPrivateKeyHex = privKeyHex;
-      sendJson(ws, makeRpc('pair', { code: pairCode, publicKey: publicKeyHex }, 2));
+      sendJson(ws, makeRpc('pair', {
+        code: pairCode,
+        publicKey: publicKeyHex,
+        name: config.name,
+        description: config.description,
+      }, 2));
       console.log('[worker] Sent pair request, waiting for approval...');
     }
   });
@@ -73,7 +118,7 @@ export function connect(hubUrl: string): void {
       return;
     }
 
-    handleMessage(ws, msg);
+    handleMessage(ws, msg, config);
   });
 
   ws.on('close', () => {
@@ -82,7 +127,7 @@ export function connect(hubUrl: string): void {
       activeTerminal.kill();
       activeTerminal = null;
     }
-    setTimeout(() => connect(hubUrl), RECONNECT_DELAY_MS);
+    setTimeout(() => connect(hubUrl, config), RECONNECT_DELAY_MS);
   });
 
   ws.on('error', (err) => {
@@ -92,7 +137,8 @@ export function connect(hubUrl: string): void {
 
 function handleMessage(
   ws: WebSocket,
-  msg: JsonRpcRequest | JsonRpcResponse
+  msg: JsonRpcRequest | JsonRpcResponse,
+  config: WorkerConfig
 ): void {
   // Distinguish request vs response by checking for 'method' property
   if (!('method' in msg)) {
@@ -112,9 +158,16 @@ function handleMessage(
       if (params.success) {
         console.log('\n✅ Pairing approved!');
         console.log(`NODE_ID=${params.nodeId}`);
-        console.log(`PRIVATE_KEY_HEX=${pendingPrivateKeyHex ?? ''}`);
-        console.log('\nSave these to your .env file. Waiting for commands...\n');
-        pendingPrivateKeyHex = null;
+        // Auto-save credentials
+        if (pendingPrivateKeyHex) {
+          saveCredentials(params.nodeId, pendingPrivateKeyHex);
+          // Update env so reconnect uses auth flow
+          process.env.NODE_ID = params.nodeId;
+          process.env.PRIVATE_KEY_HEX = pendingPrivateKeyHex;
+          pendingPrivateKeyHex = null;
+        }
+        // Send declare after successful pairing
+        sendDeclare(ws, config);
       } else {
         console.error('[worker] Pairing rejected:', params.error);
         ws.close();
@@ -142,7 +195,9 @@ function handleMessage(
     case 'auth_result': {
       const params = req.params as AuthResultParams;
       if (params.success) {
-        console.log('[worker] Authenticated successfully. Waiting for spawn commands...');
+        console.log('[worker] Authenticated successfully.');
+        // Send declare after successful auth
+        sendDeclare(ws, config);
       } else {
         console.error('[worker] Authentication failed:', params.error);
         ws.close();
