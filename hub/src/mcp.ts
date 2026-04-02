@@ -140,7 +140,7 @@ function registerAgentTool(server: McpServer, agent: AgentRow): void {
     description,
     {
       intent: z.string().describe('What you want this agent to do'),
-      timeout_ms: z.number().optional().describe('If set, block up to this many ms waiting for result. Omit for async.'),
+      timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
     },
     async ({ intent, timeout_ms }) => {
       return handleToolCall(agent, intent, timeout_ms, 'explicit');
@@ -202,7 +202,7 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
     'Route a task to the best available agent based on intent. Set timeout_ms to wait for the result.',
     {
       intent: z.string().describe('Natural language description of what you want done'),
-      timeout_ms: z.number().optional().describe('If set, block up to this many ms waiting for result. Omit for async.'),
+      timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
     },
     async ({ intent, timeout_ms }) => {
       const agent = findAgentByCapability(intent);

@@ -23,6 +23,7 @@ import {
   deleteDefaultAgentByChatId,
   updateTaskStatus,
   getRunningTasksByNodeId,
+  getTask,
 } from './db.js';
 import { escapeHtml } from './format.js';
 import type {
@@ -206,8 +207,8 @@ export function createGateway(
 
     ws.on('message', async (data, isBinary) => {
       if (isBinary) {
-        // Binary frames = TTY data; forward to registered callback
-        if (session.nodeId && ttyOutputCallback) {
+        // Binary frames = TTY data; only accept from authenticated workers
+        if (session.authenticated && session.nodeId && ttyOutputCallback) {
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
           ttyOutputCallback(session.nodeId, buf);
           touchSession(session.nodeId);
@@ -372,13 +373,18 @@ async function handleMessage(
         sendJson(session.ws, makeError(req.id, -32602, 'Invalid params'));
         return;
       }
+      // Verify nodeId matches what was set during auth request
+      if (params.nodeId !== session.nodeId) {
+        sendJson(session.ws, makeError(req.id, -32004, 'NodeId mismatch'));
+        return;
+      }
       if (!session.challenge || session.challenge !== params.challenge) {
         sendJson(session.ws, makeError(req.id, -32004, 'Challenge mismatch'));
         return;
       }
       const node = getNodeById(params.nodeId);
-      if (!node) {
-        sendJson(session.ws, makeError(req.id, -32003, 'Unknown node'));
+      if (!node || !node.approved) {
+        sendJson(session.ws, makeError(req.id, -32003, 'Unknown or revoked node'));
         return;
       }
       try {
@@ -395,6 +401,15 @@ async function handleMessage(
           sendJson(session.ws, makeResult(req.id, { success: false, error: 'Invalid signature' }));
           return;
         }
+        // Terminate any existing session for this nodeId (prevent dual-session takeover)
+        const existingWsId = nodeMap.get(params.nodeId);
+        if (existingWsId && existingWsId !== connId) {
+          const oldSession = sessions.get(existingWsId);
+          if (oldSession) {
+            oldSession.authenticated = false;
+            oldSession.ws.close(4409, 'Superseded by new connection');
+          }
+        }
         session.authenticated = true;
         session.challenge = undefined;
         nodeMap.set(params.nodeId, connId);
@@ -408,6 +423,7 @@ async function handleMessage(
     }
 
     case 'spawn_result': {
+      if (!session.authenticated) return;
       const params = req.params as SpawnResult;
       console.log(`[gateway] spawn_result from node ${session.nodeId}: success=${params.success}`);
       if (!params.success && session.nodeId) {
@@ -423,6 +439,7 @@ async function handleMessage(
     }
 
     case 'exit': {
+      if (!session.authenticated) return;
       const params = req.params as ExitParams;
       console.log(`[gateway] exit from node ${session.nodeId}: code=${params.code}`);
       if (session.nodeId) {
@@ -456,6 +473,12 @@ async function handleMessage(
         console.warn('[gateway] Malformed output message, ignoring');
         break;
       }
+      // Verify this worker owns the task (prevent cross-worker spoofing)
+      const taskForOutput = getTask(params.taskId);
+      if (taskForOutput && taskForOutput.node_id !== session.nodeId) {
+        console.warn(`[gateway] Node ${session.nodeId} sent output for task owned by ${taskForOutput.node_id}, ignoring`);
+        break;
+      }
       // Update task status based on output type
       if (params.type === 'result') {
         const payload = params.payload as { text?: string };
@@ -481,10 +504,15 @@ async function handleMessage(
         sendJson(session.ws, makeError(req.id, -32006, 'Not authenticated'));
         return;
       }
+      const MAX_AGENTS_PER_NODE = 50;
       const params = req.params as DeclareParams;
+      if ((params.agents?.length ?? 0) > MAX_AGENTS_PER_NODE) {
+        sendJson(session.ws, makeError(req.id, -32602, `Too many agents (max ${MAX_AGENTS_PER_NODE})`));
+        return;
+      }
       if (params.name) updateNodeName(session.nodeId, params.name);
       if (params.description) updateNodeDescription(session.nodeId, params.description);
-      // Replace all agents for this node
+      // Replace all agents for this node only — namespaced by node_id
       deleteAgentsByNodeId(session.nodeId);
       for (const agent of params.agents ?? []) {
         upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description, agent.capabilities, agent.contextAware);

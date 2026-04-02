@@ -6,7 +6,7 @@ import type { NodeRow, PairCodeRow, AgentRow, SessionRow, DefaultAgentRow, TaskR
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(__dirname, '..', 'data');
-mkdirSync(dataDir, { recursive: true });
+mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
 const db = new Database(join(dataDir, 'anyagent.db'));
 
@@ -44,6 +44,9 @@ try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT '
 try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN context_aware INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
+// Fix agent name collision: namespace by (name, node_id) instead of name alone
+try { db.exec(`DROP INDEX IF EXISTS sqlite_autoindex_agents_1`); } catch { /* may not exist */ }
+try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_node ON agents(name, node_id)`); } catch { /* already exists */ }
 
 // Session and default agent persistence
 db.exec(`
@@ -126,8 +129,10 @@ export function nodeExists(nodeId: string): boolean {
 
 // Agent operations
 export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[], contextAware?: boolean): void {
+  // Keyed on (name, node_id) — prevents cross-worker agent name hijacking
+  db.prepare(`DELETE FROM agents WHERE name = ? AND node_id = ?`).run(name, nodeId);
   db.prepare(
-    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description, capabilities, context_aware) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO agents (name, node_id, binary, args_json, description, capabilities, context_aware) VALUES (?, ?, ?, ?, ?, ?, ?)`
   ).run(name, nodeId, binary, JSON.stringify(args), description ?? '', JSON.stringify(capabilities ?? []), contextAware === false ? 0 : 1);
 }
 
@@ -254,6 +259,14 @@ export function clearAllSessions(): void {
 // Query running tasks by node (targeted, not scanning recent)
 export function getRunningTasksByNodeId(nodeId: string): TaskRow[] {
   return db.prepare(`SELECT * FROM tasks WHERE node_id = ? AND status = 'running'`).all(nodeId) as TaskRow[];
+}
+
+// Revoke a node — delete it and all its agents
+export function revokeNode(nodeId: string): boolean {
+  deleteAgentsByNodeId(nodeId);
+  deleteSessionByNodeId(nodeId);
+  const result = db.prepare(`DELETE FROM nodes WHERE node_id = ?`).run(nodeId);
+  return result.changes > 0;
 }
 
 // Purge all task data for a specific chat

@@ -3,18 +3,32 @@ import { createWorker } from '@anyagent/sdk';
 import type { WorkerConfig, SpawnParams } from '@anyagent/sdk';
 import { spawnTerminal, TerminalSession } from './terminal.js';
 
-const HUB_URL = process.env.HUB_URL ?? 'ws://localhost:8080';
+// CLI args override env vars: --hub, --pair, --secret, --name, --desc, --agents
+function getArg(flag: string): string | undefined {
+  const idx = process.argv.indexOf(flag);
+  return idx !== -1 && idx + 1 < process.argv.length ? process.argv[idx + 1] : undefined;
+}
+
+const HUB_URL = getArg('--hub') ?? process.env.HUB_URL ?? 'ws://localhost:8080';
+const PAIR_CODE = getArg('--pair') ?? process.env.PAIR_CODE;
+const WS_SECRET = getArg('--secret') ?? process.env.WS_SECRET;
+const WORKER_NAME = getArg('--name') ?? process.env.WORKER_NAME ?? '';
+const WORKER_DESC = getArg('--desc') ?? process.env.WORKER_DESCRIPTION ?? '';
+const WORKER_AGENTS_RAW = getArg('--agents') ?? process.env.WORKER_AGENTS;
+
+// Set env vars so the SDK picks them up (SDK reads process.env for auth)
+if (PAIR_CODE) process.env.PAIR_CODE = PAIR_CODE;
+if (WS_SECRET) process.env.WS_SECRET = WS_SECRET;
 
 const config: WorkerConfig = {
-  name: process.env.WORKER_NAME ?? '',
-  description: process.env.WORKER_DESCRIPTION ?? '',
+  name: WORKER_NAME,
+  description: WORKER_DESC,
   agents: [],
 };
 
-if (process.env.WORKER_AGENTS) {
+if (WORKER_AGENTS_RAW) {
   try {
-    const parsed = JSON.parse(process.env.WORKER_AGENTS);
-    // Support both v1 format (no capabilities) and v2 format (with capabilities)
+    const parsed = JSON.parse(WORKER_AGENTS_RAW);
     config.agents = parsed.map((a: Record<string, unknown>) => ({
       name: a.name as string,
       binary: a.binary as string,
@@ -23,9 +37,36 @@ if (process.env.WORKER_AGENTS) {
       capabilities: (a.capabilities as string[]) ?? [],
     }));
   } catch (err) {
-    console.error('[worker] Failed to parse WORKER_AGENTS:', err instanceof Error ? err.message : err);
-    console.error('[worker] WARNING: No agents will be declared. Fix WORKER_AGENTS JSON in .env');
+    console.error('[worker] Failed to parse agents:', err instanceof Error ? err.message : err);
+    console.error('[worker] WARNING: No agents will be declared. Fix --agents JSON or WORKER_AGENTS in .env');
   }
+}
+
+// Help flag
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(`
+AnyAgent Worker — connect this machine to your hub
+
+Usage:
+  node dist/index.js [options]
+
+Options:
+  --hub <url>       Hub WebSocket URL (default: ws://localhost:8080)
+  --pair <code>     Pairing code from /pair command (first-time only)
+  --secret <token>  WS_SECRET to match hub (if hub requires it)
+  --name <name>     Worker display name
+  --desc <text>     Worker description
+  --agents <json>   Agent declarations as JSON array
+  -h, --help        Show this help
+
+Environment variables (overridden by CLI args):
+  HUB_URL, PAIR_CODE, WS_SECRET, WORKER_NAME, WORKER_DESCRIPTION, WORKER_AGENTS
+
+Example:
+  node dist/index.js --hub ws://192.168.1.5:8080 --pair ABC123 --name my-server \\
+    --agents '[{"name":"claude","binary":"claude","args":[],"capabilities":["coding"]}]'
+`);
+  process.exit(0);
 }
 
 let activeTerminal: TerminalSession | null = null;
@@ -59,7 +100,6 @@ const worker = createWorker(HUB_URL, config, {
       activeTerminal = session;
       worker.sendSpawnResult(true, session.pid);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
       worker.sendSpawnResult(false, undefined, 'Spawn failed');
       worker.sendError('Spawn failed');
     }

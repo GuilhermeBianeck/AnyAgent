@@ -23,7 +23,12 @@ if (stale > 0) console.log(`[hub] Marked ${stale} stale task(s) as failed`);
 clearAllSessions();
 cleanOldTasks(30);
 
-const bot = createBot(BOT_TOKEN, allowedUserId);
+const bot = createBot(BOT_TOKEN, allowedUserId, {
+  wsPort: WS_PORT,
+  wsSecret: WS_SECRET,
+  mcpPort: MCP_PORT,
+  mcpToken: MCP_TOKEN,
+});
 createGateway(WS_PORT, bot, allowedUserId, WS_SECRET);
 
 // MCP server (opt-in: requires MCP_TOKEN to enable)

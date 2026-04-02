@@ -4,7 +4,7 @@ RUN apk add --no-cache python3 build-base
 
 WORKDIR /sdk
 COPY sdk/package*.json ./
-RUN npm install
+RUN npm ci
 COPY sdk/tsconfig.json ./
 COPY sdk/src/ ./src/
 RUN npm run build
@@ -18,7 +18,7 @@ COPY --from=sdk-builder /sdk ./
 
 WORKDIR /app
 COPY worker/package*.json ./
-RUN npm install
+RUN npm ci
 COPY worker/tsconfig.json ./
 COPY worker/src/ ./src/
 RUN npm run build
@@ -26,13 +26,16 @@ RUN npm run build
 FROM node:20-alpine
 
 RUN apk add --no-cache python3 build-base
+RUN addgroup -S app && adduser -S app -G app
 
 WORKDIR /sdk
-COPY --from=sdk-builder /sdk ./
+COPY --from=sdk-builder --chown=app:app /sdk ./
 
 WORKDIR /app
 COPY worker/package*.json ./
-RUN npm install --omit=dev
-COPY --from=worker-builder /app/dist ./dist
+RUN npm ci --omit=dev && chown -R app:app /app
+COPY --from=worker-builder --chown=app:app /app/dist ./dist
+
+USER app
 
 CMD ["node", "dist/index.js"]

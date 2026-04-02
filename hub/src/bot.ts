@@ -4,7 +4,7 @@ import {
   insertPairCode, getAllNodes, getAgentByName, getAllAgents,
   insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
   getLastCompletedTask, getQueuedTasksByNodeId, getRunningTasksByNodeId,
-  purgeTasksByChatId,
+  purgeTasksByChatId, revokeNode,
 } from './db.js';
 import {
   isNodeOnline,
@@ -158,32 +158,34 @@ async function startAgentForTask(
 }
 
 // --- Process next queued task for a node ---
+// Iterative (not recursive) queue processing — prevents stack overflow
 async function processNextQueued(bot: Bot, nodeId: string): Promise<void> {
-  const queued = getQueuedTasksByNodeId(nodeId);
-  if (queued.length === 0) return;
+  while (true) {
+    const queued = getQueuedTasksByNodeId(nodeId);
+    if (queued.length === 0) return;
 
-  const next = queued[0];
-  const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
-  if (!agent || !next.chat_id) {
-    updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
-    return;
+    const next = queued[0];
+    const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
+    if (!agent || !next.chat_id) {
+      updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
+      continue; // try next
+    }
+
+    const agentArgs: string[] = JSON.parse(agent.args_json);
+    const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, next.intent);
+    if (!ok) {
+      updateTaskStatus(next.task_id, 'failed', { error: 'Failed to spawn from queue' });
+      await sendHtmlDirect(bot, next.chat_id, `❌ Queued task failed to start on <code>${escapeHtml(agent.name)}</code>.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${next.task_id}` }]] },
+      });
+      continue; // try next
+    }
+
+    setActiveSession(agent.node_id, next.chat_id, agent.name);
+    updateTaskStatus(next.task_id, 'running');
+    await sendHtmlDirect(bot, next.chat_id, `▶️ Queued task started on <code>${escapeHtml(agent.name)}</code>.`);
+    return; // successfully started one task, stop
   }
-
-  const agentArgs: string[] = JSON.parse(agent.args_json);
-  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, next.intent);
-  if (!ok) {
-    updateTaskStatus(next.task_id, 'failed', { error: 'Failed to spawn from queue' });
-    await sendHtmlDirect(bot, next.chat_id, `❌ Queued task failed to start on <code>${escapeHtml(agent.name)}</code>.`, {
-      reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${next.task_id}` }]] },
-    });
-    // Try next in queue
-    await processNextQueued(bot, nodeId);
-    return;
-  }
-
-  setActiveSession(agent.node_id, next.chat_id, agent.name);
-  updateTaskStatus(next.task_id, 'running');
-  await sendHtmlDirect(bot, next.chat_id, `▶️ Queued task started on <code>${escapeHtml(agent.name)}</code>.`);
 }
 
 // --- Status emoji helper ---
@@ -200,7 +202,14 @@ function statusEmoji(status: TaskStatus): string {
   }
 }
 
-export function createBot(token: string, allowedUserId: number): Bot {
+export interface BotConfig {
+  wsPort: number;
+  wsSecret?: string;
+  mcpPort: number;
+  mcpToken?: string;
+}
+
+export function createBot(token: string, allowedUserId: number, config?: BotConfig): Bot {
   const bot = new Bot(token);
 
   // --- TTY output buffering (legacy, edit-in-place) ---
@@ -426,7 +435,25 @@ export function createBot(token: string, allowedUserId: number): Bot {
     const code = randomBytes(16).toString('hex').toUpperCase();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     insertPairCode(code, expiresAt, '');
-    await sendHtml(ctx, `🔑 Pairing code: <code>${escapeHtml(code)}</code>\nExpires in 10 minutes.\nSet <code>PAIR_CODE=${escapeHtml(code)}</code> on your worker.`);
+
+    // Build ready-to-paste commands
+    const wsPort = config?.wsPort ?? 8080;
+    const wsSecret = config?.wsSecret;
+    const hubHost = 'YOUR_HUB_IP';
+    const hubUrl = `ws://${hubHost}:${wsPort}`;
+    const secretArg = wsSecret ? ` --secret ${escapeHtml(wsSecret)}` : '';
+    const secretEnv = wsSecret ? ` -e WS_SECRET=${escapeHtml(wsSecret)}` : '';
+
+    let msg = `🔑 Pairing code generated. Expires in 10 minutes.\n\n`;
+    msg += `<b>Run on your worker machine:</b>\n\n`;
+    msg += `<b>If already cloned:</b>\n`;
+    msg += `<code>cd AnyAgent/worker && node dist/index.js --hub ${escapeHtml(hubUrl)} --pair ${escapeHtml(code)}${secretArg}</code>\n\n`;
+    msg += `<b>Docker:</b>\n`;
+    msg += `<code>docker run -e HUB_URL=${escapeHtml(hubUrl)} -e PAIR_CODE=${escapeHtml(code)}${secretEnv} anyagent/worker</code>\n\n`;
+    msg += `Replace <code>${escapeHtml(hubHost)}</code> with your hub machine's IP.\n`;
+    msg += `Then tap ✅ Approve when prompted.`;
+
+    await sendHtml(ctx, msg);
   });
 
   // --- /workers ---
@@ -633,6 +660,23 @@ export function createBot(token: string, allowedUserId: number): Bot {
       await ctx.editMessageText(`🗑️ Purged ${count} task(s). Default agent and active session cleared.`);
       await ctx.answerCallbackQuery({ text: `${count} tasks purged.` });
       updatePinnedStatus();
+    }
+  });
+
+  // --- /revoke <node_id> ---
+  bot.command('revoke', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const nodeId = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    if (!nodeId) {
+      await ctx.reply('Usage: /revoke <node_id>');
+      return;
+    }
+    const revoked = revokeNode(nodeId);
+    if (revoked) {
+      await sendHtml(ctx, `✅ Node <code>${escapeHtml(nodeId)}</code> revoked. All agents removed.`);
+      updatePinnedStatus();
+    } else {
+      await sendHtml(ctx, `❌ Node <code>${escapeHtml(nodeId)}</code> not found.`);
     }
   });
 

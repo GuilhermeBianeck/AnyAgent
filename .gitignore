@@ -4,3 +4,6 @@ dist/
 .env.hub
 .env.worker
 *.db
+*.db-wal
+*.db-shm
+data/

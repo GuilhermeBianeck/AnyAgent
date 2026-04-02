@@ -1,0 +1,11 @@
+.env*
+hub/.env
+hub/data/
+**/.env
+**/node_modules/
+**/dist/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.git/
+docs/
