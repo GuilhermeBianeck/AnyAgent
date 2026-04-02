@@ -102,6 +102,7 @@ export interface AgentRow {
   args_json: string; // JSON-encoded string[]
   description: string;
   capabilities: string; // JSON-encoded string[] (v2)
+  context_aware: number; // 0 or 1, default 1 (v2)
   created_at: string;
 }
 
@@ -121,6 +122,7 @@ export interface TaskRow {
   node_id: string | null;
   result_summary: string | null;
   error: string | null;
+  retry_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -167,5 +169,6 @@ export interface DeclareParams {
     args: string[];
     description: string;
     capabilities?: string[]; // v2
+    contextAware?: boolean; // v2, default true
   }>;
 }

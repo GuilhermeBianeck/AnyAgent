@@ -3,7 +3,7 @@ import { randomBytes } from 'crypto';
 import {
   insertPairCode, getAllNodes, getAgentByName, getAllAgents,
   insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
-  getLastCompletedTask, getQueuedTasksByNodeId,
+  getLastCompletedTask, getQueuedTasksByNodeId, getRunningTasksByNodeId,
 } from './db.js';
 import {
   isNodeOnline,
@@ -131,12 +131,16 @@ async function startAgentForTask(
     }
     updateTaskStatus(taskId, 'queued', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
     const position = queued.length + 1;
-    await sendHtmlDirect(bot, chatId, `⏳ Agent <code>${escapeHtml(agent.name)}</code> is busy. Task queued (position #${position}).`);
+    await sendHtmlDirect(bot, chatId, `⏳ Agent <code>${escapeHtml(agent.name)}</code> is busy. Task queued (position #${position}).`, {
+      reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cancel:${taskId}` }]] },
+    });
     return true; // Queued, will start later
   }
 
   const agentArgs: string[] = JSON.parse(agent.args_json);
-  const spawnContext = context ? `[Context from previous task: ${context}]\n${intent}` : intent;
+  // Fix 6: skip context injection for agents with context_aware=false
+  const isContextAware = agent.context_aware !== 0;
+  const spawnContext = (context && isContextAware) ? `[Context from previous task: ${context}]\n${intent}` : intent;
   const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, taskId, spawnContext);
   if (!ok) {
     updateTaskStatus(taskId, 'failed', { error: 'Failed to spawn', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
@@ -172,7 +176,7 @@ async function processNextQueued(bot: Bot, nodeId: string): Promise<void> {
       reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${next.task_id}` }]] },
     });
     // Try next in queue
-    processNextQueued(bot, nodeId);
+    await processNextQueued(bot, nodeId);
     return;
   }
 
@@ -252,16 +256,20 @@ export function createBot(token: string, allowedUserId: number): Bot {
     bot.api.sendChatAction(chatId, 'typing').catch(() => {});
   }
 
-  // Legacy TTY output callback
+  // Legacy TTY output callback — suppressed for tasks using structured output
   onTtyOutput((nodeId, data) => {
     const session = getActiveSession(nodeId);
-    if (session) {
-      appendOutput(session.chatId, data.toString('utf-8'));
-    }
+    if (!session) return;
+    // Fix 4: check if this node's running task is using structured output
+    const running = getRunningTasksByNodeId(nodeId);
+    const isStructured = running.some(t => structuredTasks.has(t.task_id));
+    if (isStructured) return; // suppress TTY — structured output is handling rendering
+    appendOutput(session.chatId, data.toString('utf-8'));
   });
 
   // --- Structured output rendering (P0-4 Telegram side) ---
   const structuredMessageIds = new Map<string, number>(); // taskId → messageId for progress edits
+  const structuredTasks = new Set<string>(); // taskIds using structured output (suppress TTY for these)
 
   onStructuredOutput((nodeId, params: OutputParams) => {
     const session = getActiveSession(nodeId);
@@ -269,6 +277,9 @@ export function createBot(token: string, allowedUserId: number): Bot {
     if (!chatId) return;
 
     const { taskId, type, payload } = params;
+
+    // Fix 4: mark this task as using structured output
+    structuredTasks.add(taskId);
 
     switch (type) {
       case 'status': {
@@ -294,25 +305,24 @@ export function createBot(token: string, allowedUserId: number): Bot {
       case 'result': {
         const p = payload as { text?: string };
         structuredMessageIds.delete(taskId);
+        structuredTasks.delete(taskId);
         const resultText = p.text ?? '';
         const chunks = splitMessage(escapeHtml(resultText), 3900);
         for (const chunk of chunks) {
           bot.api.sendMessage(chatId, chunk, { parse_mode: 'HTML' }).catch(() => {});
         }
-        // Clear session and process queue
-        clearActiveSession(nodeId);
-        processNextQueued(bot, nodeId);
+        // Session clearing + queue processing now handled by gateway via onSessionEnd
         break;
       }
       case 'error': {
         const p = payload as { message?: string };
         structuredMessageIds.delete(taskId);
+        structuredTasks.delete(taskId);
         bot.api.sendMessage(chatId, `❌ ${escapeHtml(p.message ?? 'Unknown error')}`, {
           parse_mode: 'HTML',
           reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
         }).catch(() => {});
-        clearActiveSession(nodeId);
-        processNextQueued(bot, nodeId);
+        // Session clearing + queue processing now handled by gateway via onSessionEnd
         break;
       }
     }
@@ -411,7 +421,7 @@ export function createBot(token: string, allowedUserId: number): Bot {
   // --- /pair ---
   bot.command('pair', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    const code = randomBytes(3).toString('hex').toUpperCase();
+    const code = randomBytes(16).toString('hex').toUpperCase();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     insertPairCode(code, expiresAt, '');
     await sendHtml(ctx, `🔑 Pairing code: <code>${escapeHtml(code)}</code>\nExpires in 10 minutes.\nSet <code>PAIR_CODE=${escapeHtml(code)}</code> on your worker.`);
@@ -710,13 +720,33 @@ export function createBot(token: string, allowedUserId: number): Bot {
       return;
     }
 
+    // Fix 2: enforce max 3 retries
+    if (original.retry_count >= 3) {
+      await ctx.answerCallbackQuery({ text: 'Max retries reached (3).' });
+      return;
+    }
+
     await ctx.answerCallbackQuery({ text: 'Retrying...' });
 
     const taskId = createTaskId();
     const retryContext = original.error ? `Previous attempt failed: ${original.error}` : undefined;
-    insertTask(taskId, original.source, original.intent, original.chat_id ?? undefined);
+    insertTask(taskId, original.source, original.intent, original.chat_id ?? undefined, original.retry_count + 1);
     await startAgentForTask(bot, ctx.chat!.id, agent, taskId, original.intent, 'explicit', retryContext);
     updatePinnedStatus();
+  });
+
+  // --- Callback: cancel queued task ---
+  bot.callbackQuery(/^cancel:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const task = getTask(taskId);
+    if (!task || task.status !== 'queued') {
+      await ctx.answerCallbackQuery({ text: 'Task not found or already started.' });
+      return;
+    }
+    updateTaskStatus(taskId, 'failed', { error: 'Cancelled by user' });
+    await ctx.editMessageText('❌ Queued task cancelled.');
+    await ctx.answerCallbackQuery({ text: 'Cancelled.' });
   });
 
   // --- Callback: route to specific agent (from ambiguous routing) ---
@@ -807,6 +837,15 @@ export function createBot(token: string, allowedUserId: number): Bot {
     await sendHtml(ctx, 'Multiple agents available. Which should handle this?', {
       reply_markup: { inline_keyboard: buttons },
     });
+
+    // Timeout: if user doesn't pick within 5 minutes, mark as timeout
+    const routedTaskId = taskId;
+    setTimeout(() => {
+      const t = getTask(routedTaskId);
+      if (t && t.status === 'routed') {
+        updateTaskStatus(routedTaskId, 'timeout', { error: 'No agent selected within 5 minutes' });
+      }
+    }, 5 * 60 * 1000);
   });
 
   return bot;

@@ -29,26 +29,38 @@ if (process.env.WORKER_AGENTS) {
 
 let activeTerminal: TerminalSession | null = null;
 
+// Build allowlist from declared agents — only these binaries can be spawned
+const allowedBinaries = new Set(config.agents.map(a => a.binary));
+
 console.log(`[worker] Connecting to hub: ${HUB_URL}`);
+console.log(`[worker] Allowed binaries: ${[...allowedBinaries].join(', ') || '(none)'}`);
 
 const worker = createWorker(HUB_URL, config, {
   onSpawn(params: SpawnParams) {
+    // Security: reject binaries not in the declared agent allowlist
+    if (!allowedBinaries.has(params.binary)) {
+      const msg = `Spawn rejected: binary "${params.binary}" not in allowlist`;
+      console.warn(`[worker] ${msg}`);
+      worker.sendSpawnResult(false, undefined, msg);
+      return;
+    }
+
     try {
       const session = spawnTerminal(
         params.binary,
         params.args ?? [],
-        // Raw output callback — sends binary TTY data via SDK
         (data: Buffer) => worker.sendRawOutput(data),
-        // Exit callback
         (code: number) => {
           activeTerminal = null;
-          worker.currentTaskId = null;
+          worker.sendExit(code);
         }
       );
       activeTerminal = session;
+      worker.sendSpawnResult(true, session.pid);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      worker.sendError(message);
+      worker.sendSpawnResult(false, undefined, 'Spawn failed');
+      worker.sendError('Spawn failed');
     }
   },
 

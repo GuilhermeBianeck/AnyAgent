@@ -42,6 +42,8 @@ db.exec(`
 try { db.exec(`ALTER TABLE nodes ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN context_aware INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 
 // Session and default agent persistence
 db.exec(`
@@ -123,16 +125,10 @@ export function nodeExists(nodeId: string): boolean {
 }
 
 // Agent operations
-export function insertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string): void {
+export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[], contextAware?: boolean): void {
   db.prepare(
-    `INSERT INTO agents (name, node_id, binary, args_json, description) VALUES (?, ?, ?, ?, ?)`
-  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '');
-}
-
-export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[]): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description, capabilities) VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '', JSON.stringify(capabilities ?? []));
+    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description, capabilities, context_aware) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '', JSON.stringify(capabilities ?? []), contextAware === false ? 0 : 1);
 }
 
 export function deleteAgentsByNodeId(nodeId: string): void {
@@ -200,10 +196,10 @@ export function deleteDefaultAgentByChatId(chatId: number): void {
 }
 
 // Task operations
-export function insertTask(taskId: string, source: TaskSource, intent: string, chatId?: number): void {
+export function insertTask(taskId: string, source: TaskSource, intent: string, chatId?: number, retryCount?: number): void {
   db.prepare(
-    `INSERT INTO tasks (task_id, source, chat_id, intent, status) VALUES (?, ?, ?, ?, 'submitted')`
-  ).run(taskId, source, chatId ?? null, intent);
+    `INSERT INTO tasks (task_id, source, chat_id, intent, status, retry_count) VALUES (?, ?, ?, ?, 'submitted', ?)`
+  ).run(taskId, source, chatId ?? null, intent, retryCount ?? 0);
 }
 
 export function getTask(taskId: string): TaskRow | undefined {
@@ -240,4 +236,22 @@ export function getQueuedTasksByNodeId(nodeId: string): TaskRow[] {
 
 export function cleanOldTasks(daysToKeep: number = 30): void {
   db.prepare(`DELETE FROM tasks WHERE created_at < datetime('now', '-' || ? || ' days')`).run(daysToKeep);
+}
+
+// Startup cleanup: mark orphaned running/queued/routed tasks as failed
+export function failStaleTasks(): number {
+  const result = db.prepare(
+    `UPDATE tasks SET status = 'failed', error = 'Hub restarted', updated_at = datetime('now')
+     WHERE status IN ('running', 'queued', 'routed')`
+  ).run();
+  return result.changes;
+}
+
+export function clearAllSessions(): void {
+  db.prepare(`DELETE FROM sessions`).run();
+}
+
+// Query running tasks by node (targeted, not scanning recent)
+export function getRunningTasksByNodeId(nodeId: string): TaskRow[] {
+  return db.prepare(`SELECT * FROM tasks WHERE node_id = ? AND status = 'running'`).all(nodeId) as TaskRow[];
 }

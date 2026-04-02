@@ -44,6 +44,10 @@ export interface WorkerClient {
   sendError: (message: string) => void;
   /** Send raw binary data (legacy TTY mode) */
   sendRawOutput: (data: Buffer) => void;
+  /** Notify hub that the spawned process exited */
+  sendExit: (code: number) => void;
+  /** Notify hub of spawn success/failure */
+  sendSpawnResult: (success: boolean, pid?: number, error?: string) => void;
   /** Current task ID (set after spawn, null when idle) */
   currentTaskId: string | null;
 }
@@ -77,7 +81,14 @@ function sendDeclare(ws: WebSocket, config: WorkerConfig): void {
   console.log(`[sdk] Declared ${config.agents.length} agent(s), protocol v${PROTOCOL_VERSION}`);
 }
 
+const NODE_ID_RE = /^node_[a-f0-9]+$/;
+
 function saveCredentials(nodeId: string, privateKeyHex: string): void {
+  // Validate nodeId to prevent .env injection via newlines or special chars
+  if (!NODE_ID_RE.test(nodeId)) {
+    console.error('[sdk] Invalid nodeId format, refusing to save:', nodeId.slice(0, 20));
+    return;
+  }
   const envPath = join(process.cwd(), '.env');
   let content = '';
   if (existsSync(envPath)) {
@@ -93,8 +104,8 @@ function saveCredentials(nodeId: string, privateKeyHex: string): void {
   } else {
     content += `\nPRIVATE_KEY_HEX=${privateKeyHex}`;
   }
-  writeFileSync(envPath, content.replace(/^\n+/, '') + '\n');
-  console.log('[sdk] Credentials saved to .env');
+  writeFileSync(envPath, content.replace(/^\n+/, '') + '\n', { mode: 0o600 });
+  console.log('[sdk] Credentials saved to .env (permissions: owner-only)');
 }
 
 export function createWorker(hubUrl: string, config: WorkerConfig, events: WorkerEvents = {}): WorkerClient {
@@ -127,12 +138,28 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
         currentWs.send(data, { binary: true });
       }
     },
+    sendExit(code: number) {
+      if (currentWs) {
+        sendJson(currentWs, makeRpc('exit', { code }));
+      }
+      client.currentTaskId = null;
+    },
+    sendSpawnResult(success: boolean, pid?: number, error?: string) {
+      if (currentWs) {
+        sendJson(currentWs, makeRpc('spawn_result', { success, pid, error }));
+      }
+    },
   };
 
   let currentWs: WebSocket | null = null;
 
   function connect(): void {
-    const ws = new WebSocket(hubUrl);
+    const headers: Record<string, string> = {};
+    const wsSecret = process.env.WS_SECRET;
+    if (wsSecret) {
+      headers['x-ws-secret'] = wsSecret;
+    }
+    const ws = new WebSocket(hubUrl, { headers });
     currentWs = ws;
 
     ws.on('open', () => {
@@ -179,9 +206,20 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
       }
 
       if (!('method' in msg)) {
+        // JSON-RPC response (not a request with a method)
         const res = msg as JsonRpcResponse;
         if (res.error) {
           console.error('[sdk] RPC error:', res.error.message);
+        } else if (res.id === 3 && res.result) {
+          // Response to auth_response (id=3) — handle auth success/failure
+          const result = res.result as AuthResult;
+          if (result.success) {
+            console.log('[sdk] Authenticated.');
+            sendDeclare(ws, config);
+          } else {
+            console.error('[sdk] Auth failed:', result.error);
+            ws.close();
+          }
         }
         return;
       }
@@ -218,19 +256,7 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
             const signature = cryptoSign(null, challengeBuf, privateKeyObj).toString('hex');
             sendJson(ws, makeRpc('auth_response', { nodeId, challenge: params.challenge, signature }, 3));
           } catch (err) {
-            console.error('[sdk] Failed to sign challenge:', err);
-            ws.close();
-          }
-          break;
-        }
-
-        case 'auth_result': {
-          const params = req.params as AuthResult;
-          if (params.success) {
-            console.log('[sdk] Authenticated.');
-            sendDeclare(ws, config);
-          } else {
-            console.error('[sdk] Authentication failed:', params.error);
+            console.error('[sdk] Failed to sign challenge:', err instanceof Error ? err.message : 'unknown error');
             ws.close();
           }
           break;

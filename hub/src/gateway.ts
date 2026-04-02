@@ -22,7 +22,7 @@ import {
   getDefaultAgentByChatId,
   deleteDefaultAgentByChatId,
   updateTaskStatus,
-  getRecentTasks,
+  getRunningTasksByNodeId,
 } from './db.js';
 import { escapeHtml } from './format.js';
 import type {
@@ -53,6 +53,7 @@ interface WorkerSession {
 type TtyCallback = (nodeId: string, data: Buffer) => void;
 type StructuredOutputCallback = (nodeId: string, params: OutputParams) => void;
 type SessionEndCallback = (nodeId: string, exitCode: number) => void;
+type AgentChangeCallback = () => void;
 
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
@@ -60,6 +61,7 @@ const pendingPairs = new Map<string, PendingPair>();
 let ttyOutputCallback: TtyCallback | null = null;
 let structuredOutputCallback: StructuredOutputCallback | null = null;
 let sessionEndCallback: SessionEndCallback | null = null;
+let agentChangeCallback: AgentChangeCallback | null = null;
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -165,13 +167,17 @@ export function onSessionEnd(callback: SessionEndCallback): void {
   sessionEndCallback = callback;
 }
 
+export function onAgentChange(callback: AgentChangeCallback): void {
+  agentChangeCallback = callback;
+}
+
 export function createGateway(
   port: number,
   bot: Bot,
   allowedUserId: number,
   wsSecret?: string
 ): WebSocketServer {
-  const wss = new WebSocketServer({ port });
+  const wss = new WebSocketServer({ port, maxPayload: 1_048_576 }); // 1MB max per message
 
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     if (wsSecret) {
@@ -220,14 +226,32 @@ export function createGateway(
     ws.on('close', () => {
       if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
       if (session.nodeId) {
-        // Notify user if there was an active session on this worker
-        const active = getActiveSession(session.nodeId);
+        const disconnectedNodeId = session.nodeId;
+        const active = getActiveSession(disconnectedNodeId);
+
+        // Remove from node map immediately so isNodeOnline returns false
+        nodeMap.delete(disconnectedNodeId);
+        if (agentChangeCallback) agentChangeCallback();
+
         if (active) {
-          const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Session';
-          bot.api.sendMessage(active.chatId, `⚠️ ${label} — worker disconnected.`, { parse_mode: 'HTML' }).catch(() => {});
-          clearActiveSession(session.nodeId);
+          // Grace period: wait 60 seconds for reconnection before marking failed
+          bot.api.sendMessage(active.chatId, `⚠️ Worker disconnected. Waiting 60s for reconnect...`, { parse_mode: 'HTML' }).catch(() => {});
+          setTimeout(() => {
+            // Check if the node reconnected (new session in nodeMap)
+            if (isNodeOnline(disconnectedNodeId)) {
+              bot.api.sendMessage(active.chatId, `✅ Worker reconnected.`, { parse_mode: 'HTML' }).catch(() => {});
+              return; // Reconnected — don't fail the task
+            }
+            // Still offline — clear session and fail tasks
+            const stillActive = getActiveSession(disconnectedNodeId);
+            if (stillActive) {
+              const label = stillActive.agentName ? `Agent <code>${escapeHtml(stillActive.agentName)}</code>` : 'Session';
+              bot.api.sendMessage(stillActive.chatId, `❌ ${label} — worker did not reconnect.`, { parse_mode: 'HTML' }).catch(() => {});
+              clearActiveSession(disconnectedNodeId);
+              if (sessionEndCallback) sessionEndCallback(disconnectedNodeId, 1);
+            }
+          }, 60_000);
         }
-        nodeMap.delete(session.nodeId);
       }
       sessions.delete(connId);
     });
@@ -241,6 +265,12 @@ export function createGateway(
     for (const row of allSessions) {
       const lastActivity = new Date(row.last_activity_at + 'Z').getTime();
       if (now - lastActivity > SESSION_TIMEOUT_MS) {
+        // Skip timeout if there are actively running tasks on this node
+        const running = getRunningTasksByNodeId(row.node_id);
+        if (running.length > 0) {
+          touchSession(row.node_id); // extend while tasks are running
+          continue;
+        }
         // Send kill to worker if online
         const wsId = nodeMap.get(row.node_id);
         if (wsId) {
@@ -370,7 +400,7 @@ async function handleMessage(
         startHeartbeat(session);
         sendJson(session.ws, makeResult(req.id, { success: true }));
       } catch (err) {
-        console.error('[gateway] Signature verification error:', err);
+        console.error('[gateway] Signature verification failed for node', params.nodeId);
         sendJson(session.ws, makeError(req.id, -32005, 'Verification failed'));
       }
       break;
@@ -378,7 +408,7 @@ async function handleMessage(
 
     case 'spawn_result': {
       const params = req.params as SpawnResult;
-      console.log(`[gateway] spawn_result from node ${session.nodeId}:`, params);
+      console.log(`[gateway] spawn_result from node ${session.nodeId}: success=${params.success}`);
       if (!params.success && session.nodeId) {
         const active = getActiveSession(session.nodeId);
         if (active) {
@@ -401,15 +431,13 @@ async function handleMessage(
           const codeStr = params.code === 0 ? 'normally' : `with code ${params.code}`;
           bot.api.sendMessage(active.chatId, `${label} exited ${codeStr}.`, { parse_mode: 'HTML' }).catch(() => {});
         }
-        // Mark any running tasks on this node as complete/failed (legacy TTY agents don't send structured output)
-        const recentTasks = getRecentTasks(20);
-        for (const task of recentTasks) {
-          if (task.node_id === session.nodeId && task.status === 'running') {
-            if (params.code === 0) {
-              updateTaskStatus(task.task_id, 'complete');
-            } else {
-              updateTaskStatus(task.task_id, 'failed', { error: `Process exited with code ${params.code}` });
-            }
+        // Mark running tasks on this node as complete/failed (legacy TTY agents don't send structured output)
+        const runningTasks = getRunningTasksByNodeId(session.nodeId);
+        for (const task of runningTasks) {
+          if (params.code === 0) {
+            updateTaskStatus(task.task_id, 'complete');
+          } else {
+            updateTaskStatus(task.task_id, 'failed', { error: `Process exited with code ${params.code}` });
           }
         }
         clearActiveSession(session.nodeId);
@@ -422,6 +450,11 @@ async function handleMessage(
     case 'output': {
       if (!session.authenticated || !session.nodeId) return;
       const params = req.params as OutputParams;
+      // Validate required fields
+      if (!params?.taskId || !params?.type || !params?.payload) {
+        console.warn('[gateway] Malformed output message, ignoring');
+        break;
+      }
       // Update task status based on output type
       if (params.type === 'result') {
         const payload = params.payload as { text?: string };
@@ -433,6 +466,11 @@ async function handleMessage(
       // Forward to callback (bot.ts will render to Telegram)
       if (structuredOutputCallback) {
         structuredOutputCallback(session.nodeId, params);
+      }
+      // Clear session and process queue on terminal output types
+      if (params.type === 'result' || params.type === 'error') {
+        clearActiveSession(session.nodeId);
+        if (sessionEndCallback) sessionEndCallback(session.nodeId, params.type === 'result' ? 0 : 1);
       }
       break;
     }
@@ -448,11 +486,12 @@ async function handleMessage(
       // Replace all agents for this node
       deleteAgentsByNodeId(session.nodeId);
       for (const agent of params.agents ?? []) {
-        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description, agent.capabilities);
+        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description, agent.capabilities, agent.contextAware);
       }
       const pv = params.protocolVersion ?? 1;
       console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s), protocol v${pv}`);
       sendJson(session.ws, makeResult(req.id, { success: true }));
+      if (agentChangeCallback) agentChangeCallback();
       break;
     }
 

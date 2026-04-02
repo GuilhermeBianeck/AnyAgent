@@ -20,6 +20,7 @@ export interface AgentDef {
   args: string[];
   description: string;
   capabilities: string[];
+  contextAware?: boolean; // default true; set false to skip context injection
 }
 
 // Worker configuration

@@ -8,6 +8,19 @@ export interface TerminalSession {
   write: (data: string) => void;
 }
 
+// Secrets that must NEVER reach child processes
+const SECRET_ENV_KEYS = ['PRIVATE_KEY_HEX', 'PAIR_CODE', 'NODE_ID', 'HUB_URL', 'WS_SECRET'];
+
+function sanitizeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !SECRET_ENV_KEYS.includes(key)) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
 export function spawnTerminal(
   binary: string,
   args: string[],
@@ -19,7 +32,7 @@ export function spawnTerminal(
     cols: 80,
     rows: 24,
     cwd: process.env.HOME ?? homedir(),
-    env: process.env as Record<string, string>,
+    env: sanitizeEnv(),
   });
 
   ptyProcess.onData((data: string) => {
