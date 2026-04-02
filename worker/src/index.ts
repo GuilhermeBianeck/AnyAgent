@@ -23,7 +23,8 @@ if (process.env.WORKER_AGENTS) {
       capabilities: (a.capabilities as string[]) ?? [],
     }));
   } catch (err) {
-    console.error('[worker] Failed to parse WORKER_AGENTS:', err);
+    console.error('[worker] Failed to parse WORKER_AGENTS:', err instanceof Error ? err.message : err);
+    console.error('[worker] WARNING: No agents will be declared. Fix WORKER_AGENTS JSON in .env');
   }
 }
 

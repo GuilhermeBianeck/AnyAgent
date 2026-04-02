@@ -46,11 +46,10 @@ function findAgentByCapability(intent: string): AgentRow | undefined {
 
 const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH ?? '3', 10);
 
-function spawnAgentTask(agent: AgentRow, intent: string, routingMethod: 'matched' | 'explicit' = 'matched'): { taskId: string; status: 'running' | 'queued' | 'failed' } {
+function spawnAgentTaskSync(agent: AgentRow, intent: string, routingMethod: 'matched' | 'explicit' = 'matched'): { taskId: string; status: 'running' | 'queued' | 'failed' } {
   const taskId = `task_${randomBytes(6).toString('hex')}`;
   insertTask(taskId, 'mcp', intent);
 
-  // Check if worker is busy (has active session)
   const existingSession = getActiveSession(agent.node_id);
   if (existingSession) {
     const queued = getQueuedTasksByNodeId(agent.node_id);
@@ -71,11 +70,58 @@ function spawnAgentTask(agent: AgentRow, intent: string, routingMethod: 'matched
     return { taskId, status: 'failed' };
   }
 
-  setActiveSession(agent.node_id, 0, agent.name); // chatId=0 for MCP-initiated sessions
+  setActiveSession(agent.node_id, 0, agent.name);
   updateTaskStatus(taskId, 'running', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
   const task = getTask(taskId);
   if (task && onMcpTaskCallback) onMcpTaskCallback(task);
   return { taskId, status: 'running' };
+}
+
+// Wait for a task to complete, polling every 500ms up to timeoutMs
+async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const task = getTask(taskId);
+    if (task && (task.status === 'complete' || task.status === 'failed' || task.status === 'timeout')) {
+      return task;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  return null; // timed out
+}
+
+// Unified tool handler: spawn + optionally block for result
+async function handleToolCall(agent: AgentRow, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit'): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+  if (!isNodeOnline(agent.node_id)) {
+    return { content: [{ type: 'text', text: `Agent ${agent.name} is offline.` }], isError: true };
+  }
+
+  const { taskId, status } = spawnAgentTaskSync(agent, intent, routingMethod);
+
+  if (status === 'failed') {
+    return { content: [{ type: 'text', text: `Failed to spawn ${agent.name}.` }], isError: true };
+  }
+
+  // Blocking mode: wait for result if timeout_ms provided
+  if (timeoutMs && timeoutMs > 0 && (status === 'running' || status === 'queued')) {
+    const result = await waitForTask(taskId, timeoutMs);
+    if (result) {
+      if (result.status === 'complete') {
+        return { content: [{ type: 'text', text: result.result_summary ?? 'Task completed (no output).' }] };
+      }
+      if (result.status === 'failed') {
+        return { content: [{ type: 'text', text: `Task failed: ${result.error ?? 'unknown error'}` }], isError: true };
+      }
+    }
+    // Timed out waiting — fall through to async response
+    return { content: [{ type: 'text', text: `Task ${taskId} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
+  }
+
+  // Async mode: return task ID for polling
+  if (status === 'queued') {
+    return { content: [{ type: 'text', text: `Agent ${agent.name} is busy. Task ${taskId} queued. Use anyagent_task_status to check.` }] };
+  }
+  return { content: [{ type: 'text', text: `Task ${taskId} started on ${agent.name}. Use anyagent_task_status to check.` }] };
 }
 
 // Track dynamically registered per-agent tools so we can remove/re-add them
@@ -92,19 +138,12 @@ function registerAgentTool(server: McpServer, agent: AgentRow): void {
   const handle = server.tool(
     toolName,
     description,
-    { intent: z.string().describe('What you want this agent to do') },
-    async ({ intent }) => {
-      if (!isNodeOnline(agent.node_id)) {
-        return { content: [{ type: 'text' as const, text: `Agent ${agent.name} is offline.` }], isError: true };
-      }
-      const { taskId, status } = spawnAgentTask(agent, intent, 'explicit');
-      if (status === 'failed') {
-        return { content: [{ type: 'text' as const, text: `Failed to spawn ${agent.name}.` }], isError: true };
-      }
-      if (status === 'queued') {
-        return { content: [{ type: 'text' as const, text: `Agent ${agent.name} is busy. Task ${taskId} queued. Use anyagent_task_status to check.` }] };
-      }
-      return { content: [{ type: 'text' as const, text: `Task ${taskId} started on ${agent.name}. Use anyagent_task_status to check.` }] };
+    {
+      intent: z.string().describe('What you want this agent to do'),
+      timeout_ms: z.number().optional().describe('If set, block up to this many ms waiting for result. Omit for async.'),
+    },
+    async ({ intent, timeout_ms }) => {
+      return handleToolCall(agent, intent, timeout_ms, 'explicit');
     }
   );
   agentTools.set(toolName, handle);
@@ -160,21 +199,17 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
 
   server.tool(
     'anyagent_route',
-    'Route a task to the best available agent based on intent. Returns task ID for tracking.',
-    { intent: z.string().describe('Natural language description of what you want done') },
-    async ({ intent }) => {
+    'Route a task to the best available agent based on intent. Set timeout_ms to wait for the result.',
+    {
+      intent: z.string().describe('Natural language description of what you want done'),
+      timeout_ms: z.number().optional().describe('If set, block up to this many ms waiting for result. Omit for async.'),
+    },
+    async ({ intent, timeout_ms }) => {
       const agent = findAgentByCapability(intent);
       if (!agent) {
         return { content: [{ type: 'text' as const, text: 'No online agents available.' }], isError: true };
       }
-      const { taskId, status } = spawnAgentTask(agent, intent, 'matched');
-      if (status === 'failed') {
-        return { content: [{ type: 'text' as const, text: `Failed to spawn ${agent.name}.` }], isError: true };
-      }
-      if (status === 'queued') {
-        return { content: [{ type: 'text' as const, text: `Agent ${agent.name} is busy. Task ${taskId} queued. Use anyagent_task_status to check.` }] };
-      }
-      return { content: [{ type: 'text' as const, text: `Task ${taskId} started on ${agent.name}. Use anyagent_task_status to check.` }] };
+      return handleToolCall(agent, intent, timeout_ms, 'matched');
     }
   );
 

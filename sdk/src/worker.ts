@@ -288,11 +288,23 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
       }
     });
 
-    ws.on('close', () => {
-      console.log('[sdk] Disconnected. Reconnecting in 5s...');
+    ws.on('close', (code: number, reason: Buffer) => {
       currentWs = null;
       client.currentTaskId = null;
       events.onKill?.();
+
+      if (code === 4401) {
+        console.error('[sdk] Connection rejected: WS_SECRET mismatch. Check WS_SECRET env var on this worker.');
+        console.error('[sdk] NOT retrying (fix WS_SECRET and restart).');
+        return; // Do not retry — wrong secret will fail forever
+      }
+
+      if (code === 1000) {
+        console.log('[sdk] Disconnected normally.');
+      } else {
+        const reasonStr = reason.toString() || 'unknown';
+        console.log(`[sdk] Disconnected (code=${code}, reason=${reasonStr}). Reconnecting in 5s...`);
+      }
       setTimeout(connect, RECONNECT_DELAY_MS);
     });
 

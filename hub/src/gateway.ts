@@ -189,7 +189,8 @@ export function createGateway(
         tokenBuf.length === secretBuf.length &&
         timingSafeEqual(tokenBuf, secretBuf);
       if (!valid) {
-        ws.close(4401, 'Unauthorized');
+        console.warn(`[gateway] Connection rejected: invalid WS_SECRET from ${req.socket.remoteAddress}`);
+        ws.close(4401, 'Invalid or missing WS_SECRET');
         return;
       }
     }

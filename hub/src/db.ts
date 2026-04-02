@@ -255,3 +255,15 @@ export function clearAllSessions(): void {
 export function getRunningTasksByNodeId(nodeId: string): TaskRow[] {
   return db.prepare(`SELECT * FROM tasks WHERE node_id = ? AND status = 'running'`).all(nodeId) as TaskRow[];
 }
+
+// Purge all task data for a specific chat
+export function purgeTasksByChatId(chatId: number): number {
+  const result = db.prepare(`DELETE FROM tasks WHERE chat_id = ?`).run(chatId);
+  return result.changes;
+}
+
+// Purge all tasks regardless of chat
+export function purgeAllTasks(): number {
+  const result = db.prepare(`DELETE FROM tasks`).run();
+  return result.changes;
+}

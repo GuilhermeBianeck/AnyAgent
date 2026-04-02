@@ -4,6 +4,7 @@ import {
   insertPairCode, getAllNodes, getAgentByName, getAllAgents,
   insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
   getLastCompletedTask, getQueuedTasksByNodeId, getRunningTasksByNodeId,
+  purgeTasksByChatId,
 } from './db.js';
 import {
   isNodeOnline,
@@ -401,7 +402,8 @@ export function createBot(token: string, allowedUserId: number): Bot {
       '/stop — Stop the active session\n\n' +
       '<b>Config</b>\n' +
       '/default — Set an auto-start agent\n' +
-      '/status — Show and pin live status'
+      '/status — Show and pin live status\n' +
+      '/purge — Delete all task history'
     );
 
     // Create/update pinned status
@@ -598,6 +600,40 @@ export function createBot(token: string, allowedUserId: number): Bot {
     // Process queued tasks
     processNextQueued(bot, session.nodeId);
     updatePinnedStatus();
+  });
+
+  // --- /purge ---
+  bot.command('purge', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    await sendHtml(ctx, '⚠️ This will permanently delete all your task history. Continue?', {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🗑️ Purge all tasks', callback_data: 'purge:confirm' }],
+          [{ text: '❌ Cancel', callback_data: 'purge:cancel' }],
+        ],
+      },
+    });
+  });
+
+  // --- Callback: purge confirmation ---
+  bot.callbackQuery(/^purge:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const action = ctx.match[1];
+    if (action === 'cancel') {
+      await ctx.editMessageText('Purge cancelled.');
+      await ctx.answerCallbackQuery({ text: 'Cancelled.' });
+      return;
+    }
+    if (action === 'confirm') {
+      const chatId = ctx.chat!.id;
+      const count = purgeTasksByChatId(chatId);
+      clearDefaultAgent(chatId);
+      const session = getActiveSessionByChatId(chatId);
+      if (session) clearActiveSession(session.nodeId);
+      await ctx.editMessageText(`🗑️ Purged ${count} task(s). Default agent and active session cleared.`);
+      await ctx.answerCallbackQuery({ text: `${count} tasks purged.` });
+      updatePinnedStatus();
+    }
   });
 
   // --- Callback: approve/reject pair ---
