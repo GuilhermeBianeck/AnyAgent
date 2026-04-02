@@ -1,5 +1,4 @@
 import * as pty from 'node-pty';
-import { WebSocket } from 'ws';
 import { homedir } from 'os';
 
 export interface TerminalSession {
@@ -12,7 +11,7 @@ export interface TerminalSession {
 export function spawnTerminal(
   binary: string,
   args: string[],
-  ws: WebSocket,
+  onData: (data: Buffer) => void,
   onExit: (code: number) => void
 ): TerminalSession {
   const ptyProcess = pty.spawn(binary, args, {
@@ -23,11 +22,8 @@ export function spawnTerminal(
     env: process.env as Record<string, string>,
   });
 
-  // PTY stdout → binary WebSocket frames
   ptyProcess.onData((data: string) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(Buffer.from(data), { binary: true });
-    }
+    onData(Buffer.from(data));
   });
 
   ptyProcess.onExit(({ exitCode }) => {
@@ -36,14 +32,8 @@ export function spawnTerminal(
 
   return {
     pid: ptyProcess.pid,
-    resize: (cols: number, rows: number) => {
-      ptyProcess.resize(cols, rows);
-    },
-    kill: () => {
-      ptyProcess.kill();
-    },
-    write: (data: string) => {
-      ptyProcess.write(data);
-    },
+    resize: (cols: number, rows: number) => ptyProcess.resize(cols, rows),
+    kill: () => ptyProcess.kill(),
+    write: (data: string) => ptyProcess.write(data),
   };
 }

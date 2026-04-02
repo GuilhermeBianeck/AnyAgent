@@ -1,23 +1,32 @@
 import { Bot, Context } from 'grammy';
 import { randomBytes } from 'crypto';
-import { insertPairCode, getAllNodes, insertAgent, getAgentByName, getAllAgents, deleteAgent, nodeExists } from './db.js';
+import {
+  insertPairCode, getAllNodes, getAgentByName, getAllAgents,
+  insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
+  getLastCompletedTask, getQueuedTasksByNodeId,
+} from './db.js';
 import {
   isNodeOnline,
   sendSpawn,
   approvePair,
   rejectPair,
   onTtyOutput,
+  onStructuredOutput,
+  onSessionEnd,
   setActiveSession,
   getActiveSession,
   getActiveSessionByChatId,
   clearActiveSession,
   sendTtyInput,
-  setDelegateAgent,
-  getDelegateAgent,
-  clearDelegateAgent,
+  setDefaultAgent,
+  getDefaultAgent,
+  clearDefaultAgent,
 } from './gateway.js';
 import { escapeHtml } from './format.js';
-import type { AgentRow } from './types.js';
+import { stripAnsi } from './output.js';
+import type { AgentRow, OutputParams, TaskStatus } from './types.js';
+
+const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH ?? '3', 10);
 
 function guardUser(ctx: Context, allowedUserId: number): boolean {
   if (ctx.from?.id !== allowedUserId) {
@@ -49,41 +58,181 @@ async function sendHtml(ctx: Context, html: string, extra: Record<string, unknow
   }
 }
 
-/** Start an agent by name. Returns true on success. */
-async function startAgent(ctx: Context, agent: AgentRow): Promise<boolean> {
+async function sendHtmlDirect(bot: Bot, chatId: number, html: string, extra: Record<string, unknown> = {}): Promise<number | undefined> {
+  try {
+    const msg = await bot.api.sendMessage(chatId, html, { parse_mode: 'HTML', ...extra });
+    return msg.message_id;
+  } catch {
+    return undefined;
+  }
+}
+
+// --- Capability-based routing (P0-5) ---
+function findAgentByCapability(intent: string): { agent: AgentRow; method: 'default' | 'single' | 'matched' } | { agents: AgentRow[]; method: 'ambiguous' } | null {
+  const agents = getAllAgents();
+  const onlineAgents = agents.filter(a => isNodeOnline(a.node_id));
+  if (onlineAgents.length === 0) return null;
+  if (onlineAgents.length === 1) return { agent: onlineAgents[0], method: 'single' };
+
+  const intentWords = intent.toLowerCase().split(/\s+/);
+  const scored: Array<{ agent: AgentRow; score: number }> = [];
+
+  for (const agent of onlineAgents) {
+    const capabilities: string[] = JSON.parse(agent.capabilities || '[]');
+    let score = 0;
+    for (const cap of capabilities) {
+      const capLower = cap.toLowerCase();
+      for (const word of intentWords) {
+        if (word.length >= 3 && (word.includes(capLower) || capLower.includes(word))) {
+          score++;
+        }
+      }
+    }
+    scored.push({ agent, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  if (scored[0].score > 0 && (scored.length === 1 || scored[0].score > scored[1].score)) {
+    return { agent: scored[0].agent, method: 'matched' };
+  }
+
+  // Ambiguous or no match — return all online for user selection
+  return { agents: onlineAgents, method: 'ambiguous' };
+}
+
+// --- Task-aware agent start ---
+function createTaskId(): string {
+  return `task_${randomBytes(6).toString('hex')}`;
+}
+
+async function startAgentForTask(
+  bot: Bot,
+  chatId: number,
+  agent: AgentRow,
+  taskId: string,
+  intent: string,
+  routingMethod: 'default' | 'single' | 'matched' | 'explicit' | 'user_selected',
+  context?: string
+): Promise<boolean> {
   if (!isNodeOnline(agent.node_id)) {
-    await sendHtml(ctx, `❌ Agent <code>${escapeHtml(agent.name)}</code> is on node <code>${escapeHtml(agent.node_id)}</code> but the node is offline.`);
+    updateTaskStatus(taskId, 'failed', { error: 'Worker offline', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+    await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(agent.name)}</code> — worker is offline.`);
     return false;
   }
+
+  // Check queue (P0-6)
+  const existingSession = getActiveSession(agent.node_id);
+  if (existingSession) {
+    const queued = getQueuedTasksByNodeId(agent.node_id);
+    if (queued.length >= MAX_QUEUE_DEPTH) {
+      updateTaskStatus(taskId, 'failed', { error: `Queue full (${MAX_QUEUE_DEPTH})`, agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(agent.name)}</code> is busy and queue is full (${MAX_QUEUE_DEPTH}). Try again later.`);
+      return false;
+    }
+    updateTaskStatus(taskId, 'queued', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+    const position = queued.length + 1;
+    await sendHtmlDirect(bot, chatId, `⏳ Agent <code>${escapeHtml(agent.name)}</code> is busy. Task queued (position #${position}).`);
+    return true; // Queued, will start later
+  }
+
   const agentArgs: string[] = JSON.parse(agent.args_json);
-  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs);
+  const spawnContext = context ? `[Context from previous task: ${context}]\n${intent}` : intent;
+  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, taskId, spawnContext);
   if (!ok) {
-    await sendHtml(ctx, `❌ Failed to spawn agent <code>${escapeHtml(agent.name)}</code>.`);
+    updateTaskStatus(taskId, 'failed', { error: 'Failed to spawn', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+    await sendHtmlDirect(bot, chatId, `❌ Failed to spawn agent <code>${escapeHtml(agent.name)}</code>.`, {
+      reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
+    });
     return false;
   }
-  setActiveSession(agent.node_id, ctx.chat!.id, agent.name);
-  await sendHtml(ctx, `✅ Agent <code>${escapeHtml(agent.name)}</code> started. Send messages to interact. /stop to end.`);
+
+  setActiveSession(agent.node_id, chatId, agent.name);
+  updateTaskStatus(taskId, 'running', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+  await sendHtmlDirect(bot, chatId, `✅ <code>${escapeHtml(agent.name)}</code> started. Send messages to interact. /stop to end.`);
   return true;
+}
+
+// --- Process next queued task for a node ---
+async function processNextQueued(bot: Bot, nodeId: string): Promise<void> {
+  const queued = getQueuedTasksByNodeId(nodeId);
+  if (queued.length === 0) return;
+
+  const next = queued[0];
+  const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
+  if (!agent || !next.chat_id) {
+    updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
+    return;
+  }
+
+  const agentArgs: string[] = JSON.parse(agent.args_json);
+  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, next.intent);
+  if (!ok) {
+    updateTaskStatus(next.task_id, 'failed', { error: 'Failed to spawn from queue' });
+    await sendHtmlDirect(bot, next.chat_id, `❌ Queued task failed to start on <code>${escapeHtml(agent.name)}</code>.`, {
+      reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${next.task_id}` }]] },
+    });
+    // Try next in queue
+    processNextQueued(bot, nodeId);
+    return;
+  }
+
+  setActiveSession(agent.node_id, next.chat_id, agent.name);
+  updateTaskStatus(next.task_id, 'running');
+  await sendHtmlDirect(bot, next.chat_id, `▶️ Queued task started on <code>${escapeHtml(agent.name)}</code>.`);
+}
+
+// --- Status emoji helper ---
+function statusEmoji(status: TaskStatus): string {
+  switch (status) {
+    case 'submitted': return '📝';
+    case 'queued': return '⏳';
+    case 'routed': return '🔀';
+    case 'running': return '🔄';
+    case 'complete': return '✅';
+    case 'failed': return '❌';
+    case 'timeout': return '⏰';
+    default: return '❓';
+  }
 }
 
 export function createBot(token: string, allowedUserId: number): Bot {
   const bot = new Bot(token);
 
-  // --- TTY output buffering ---
-  const outputBuffers = new Map<number, string>();
+  // --- TTY output buffering (legacy, edit-in-place) ---
+  interface OutputBuffer {
+    text: string;
+    messageId?: number;
+  }
+  const outputBuffers = new Map<number, OutputBuffer>();
   let flushTimer: ReturnType<typeof setInterval> | null = null;
 
   function startFlushing(): void {
     if (flushTimer) return;
     flushTimer = setInterval(async () => {
-      for (const [chatId, text] of outputBuffers) {
-        if (!text) continue;
-        outputBuffers.set(chatId, '');
-        const chunks = splitMessage(text, 4000);
+      for (const [chatId, buf] of outputBuffers) {
+        if (!buf.text) continue;
+        const raw = buf.text;
+        buf.text = '';
+        const cleaned = stripAnsi(raw);
+        if (!cleaned.trim()) continue;
+
+        const escaped = escapeHtml(cleaned);
+        const html = `<pre>${escaped}</pre>`;
+
+        if (buf.messageId && html.length <= 4000) {
+          try {
+            await bot.api.editMessageText(chatId, buf.messageId, html, { parse_mode: 'HTML' });
+            continue;
+          } catch {
+            buf.messageId = undefined;
+          }
+        }
+
+        const chunks = splitMessage(escaped, 3900);
         for (const chunk of chunks) {
           try {
-            const escaped = escapeHtml(chunk);
-            await bot.api.sendMessage(chatId, `<pre>${escaped}</pre>`, { parse_mode: 'HTML' });
+            const sent = await bot.api.sendMessage(chatId, `<pre>${chunk}</pre>`, { parse_mode: 'HTML' });
+            buf.messageId = sent.message_id;
           } catch (err) {
             console.error('[bot] Failed to send TTY output:', err);
           }
@@ -93,11 +242,17 @@ export function createBot(token: string, allowedUserId: number): Bot {
   }
 
   function appendOutput(chatId: number, data: string): void {
-    const existing = outputBuffers.get(chatId) ?? '';
-    outputBuffers.set(chatId, existing + data);
+    const buf = outputBuffers.get(chatId);
+    if (buf) {
+      buf.text += data;
+    } else {
+      outputBuffers.set(chatId, { text: data });
+    }
     startFlushing();
+    bot.api.sendChatAction(chatId, 'typing').catch(() => {});
   }
 
+  // Legacy TTY output callback
   onTtyOutput((nodeId, data) => {
     const session = getActiveSession(nodeId);
     if (session) {
@@ -105,20 +260,152 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
   });
 
+  // --- Structured output rendering (P0-4 Telegram side) ---
+  const structuredMessageIds = new Map<string, number>(); // taskId → messageId for progress edits
+
+  onStructuredOutput((nodeId, params: OutputParams) => {
+    const session = getActiveSession(nodeId);
+    const chatId = session?.chatId;
+    if (!chatId) return;
+
+    const { taskId, type, payload } = params;
+
+    switch (type) {
+      case 'status': {
+        const p = payload as { text?: string };
+        bot.api.sendMessage(chatId, `<i>${escapeHtml(p.text ?? '')}</i>`, { parse_mode: 'HTML' }).catch(() => {});
+        break;
+      }
+      case 'progress': {
+        const p = payload as { current?: number; total?: number; label?: string };
+        const pct = p.total ? Math.round(((p.current ?? 0) / p.total) * 100) : 0;
+        const label = p.label ? ` — ${escapeHtml(p.label)}` : '';
+        const text = `🔄 ${p.current ?? 0}/${p.total ?? '?'} (${pct}%)${label}`;
+        const existingMsgId = structuredMessageIds.get(taskId);
+        if (existingMsgId) {
+          bot.api.editMessageText(chatId, existingMsgId, text, { parse_mode: 'HTML' }).catch(() => {});
+        } else {
+          bot.api.sendMessage(chatId, text, { parse_mode: 'HTML' }).then(msg => {
+            structuredMessageIds.set(taskId, msg.message_id);
+          }).catch(() => {});
+        }
+        break;
+      }
+      case 'result': {
+        const p = payload as { text?: string };
+        structuredMessageIds.delete(taskId);
+        const resultText = p.text ?? '';
+        const chunks = splitMessage(escapeHtml(resultText), 3900);
+        for (const chunk of chunks) {
+          bot.api.sendMessage(chatId, chunk, { parse_mode: 'HTML' }).catch(() => {});
+        }
+        // Clear session and process queue
+        clearActiveSession(nodeId);
+        processNextQueued(bot, nodeId);
+        break;
+      }
+      case 'error': {
+        const p = payload as { message?: string };
+        structuredMessageIds.delete(taskId);
+        bot.api.sendMessage(chatId, `❌ ${escapeHtml(p.message ?? 'Unknown error')}`, {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
+        }).catch(() => {});
+        clearActiveSession(nodeId);
+        processNextQueued(bot, nodeId);
+        break;
+      }
+    }
+  });
+
+  // --- Session end → process queue + update status ---
+  onSessionEnd((nodeId, _exitCode) => {
+    processNextQueued(bot, nodeId);
+    updatePinnedStatus();
+  });
+
+  // --- Pinned status message (P0-8) ---
+  let pinnedChatId: number | null = null;
+  let pinnedMessageId: number | null = null;
+
+  async function updatePinnedStatus(): Promise<void> {
+    if (!pinnedChatId || !pinnedMessageId) return;
+    const nodes = getAllNodes();
+    const agents = getAllAgents();
+    const onlineNodes = nodes.filter(n => isNodeOnline(n.node_id));
+    const defaultAgent = getDefaultAgent(pinnedChatId);
+    const session = getActiveSessionByChatId(pinnedChatId);
+    const recentTasks = getRecentTasksByChatId(pinnedChatId, 3);
+    const mcpPort = process.env.MCP_PORT;
+
+    let text = '<b>📍 AnyAgent Status</b>\n\n';
+    text += `<b>Workers:</b> ${onlineNodes.length}/${nodes.length} online\n`;
+    for (const n of nodes) {
+      const status = isNodeOnline(n.node_id) ? '🟢' : '🔴';
+      text += `  ${status} ${escapeHtml(n.name || n.node_id)}\n`;
+    }
+    text += `\n<b>Agents:</b> ${agents.length} registered\n`;
+    if (mcpPort) {
+      text += `<b>MCP:</b> port ${escapeHtml(mcpPort)}\n`;
+    }
+    text += '\n';
+    if (session) {
+      text += `<b>Active:</b> <code>${escapeHtml(session.agentName ?? session.nodeId)}</code>\n`;
+    }
+    if (defaultAgent) {
+      text += `<b>Default:</b> <code>${escapeHtml(defaultAgent)}</code>\n`;
+    }
+    if (recentTasks.length > 0) {
+      text += '\n<b>Recent tasks:</b>\n';
+      for (const t of recentTasks) {
+        const emoji = statusEmoji(t.status as TaskStatus);
+        const intent = t.intent.length > 40 ? t.intent.slice(0, 40) + '...' : t.intent;
+        text += `  ${emoji} ${escapeHtml(intent)}\n`;
+      }
+    }
+
+    try {
+      await bot.api.editMessageText(pinnedChatId, pinnedMessageId, text, { parse_mode: 'HTML' });
+    } catch {
+      // Message may have been deleted
+      pinnedMessageId = null;
+    }
+  }
+
+  // Update pinned status every 30 seconds
+  setInterval(updatePinnedStatus, 30_000);
+
   // --- /start ---
-  bot.command('start', (ctx) => {
+  bot.command('start', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    return sendHtml(ctx,
-      '<b>AnyAgent Hub</b> running.\n\n' +
-      '/pair — Generate a pairing code\n' +
-      '/devices — List registered devices\n' +
-      '/agents — List agents (tap to call)\n' +
+
+    await sendHtml(ctx,
+      '<b>AnyAgent</b> — personal MCP bridge for distributed agents.\n\n' +
+      '<b>Setup</b>\n' +
+      '/pair — Pair a new worker\n' +
+      '/workers — List registered workers\n\n' +
+      '<b>Usage</b>\n' +
+      '/agents — List agents (tap to start)\n' +
       '/call <code>&lt;name&gt;</code> — Start an agent session\n' +
-      '/switch — Switch active agent\n' +
-      '/stop — Stop the active session\n' +
-      '/delegate — Set default agent for auto-spawn\n' +
-      '/status — Show current status'
+      '/tasks — Recent task history\n' +
+      '/stop — Stop the active session\n\n' +
+      '<b>Config</b>\n' +
+      '/default — Set an auto-start agent\n' +
+      '/status — Show and pin live status'
     );
+
+    // Create/update pinned status
+    if (!pinnedMessageId) {
+      pinnedChatId = ctx.chat!.id;
+      const nodes = getAllNodes();
+      const onlineNodes = nodes.filter(n => isNodeOnline(n.node_id));
+      const text = `<b>📍 AnyAgent Status</b>\n\nWorkers: ${onlineNodes.length}/${nodes.length} online\nAgents: ${getAllAgents().length} registered`;
+      try {
+        const msg = await bot.api.sendMessage(ctx.chat!.id, text, { parse_mode: 'HTML' });
+        pinnedMessageId = msg.message_id;
+        await bot.api.pinChatMessage(ctx.chat!.id, msg.message_id, { disable_notification: true }).catch(() => {});
+      } catch { /* ignore pin failures in non-group chats */ }
+    }
   });
 
   // --- /pair ---
@@ -130,27 +417,25 @@ export function createBot(token: string, allowedUserId: number): Bot {
     await sendHtml(ctx, `🔑 Pairing code: <code>${escapeHtml(code)}</code>\nExpires in 10 minutes.\nSet <code>PAIR_CODE=${escapeHtml(code)}</code> on your worker.`);
   });
 
-  // --- /devices (alias: /list) ---
-  async function handleDevices(ctx: Context): Promise<void> {
+  // --- /workers ---
+  async function handleWorkers(ctx: Context): Promise<void> {
     if (!guardUser(ctx, allowedUserId)) return;
     const nodes = getAllNodes();
     if (nodes.length === 0) {
-      await ctx.reply('No devices registered. Use /pair to add one.');
+      await ctx.reply('No workers registered. Use /pair to add one.');
       return;
     }
     const buttons = nodes.map((n) => {
       const status = isNodeOnline(n.node_id) ? '🟢' : '🔴';
       const label = n.name || n.node_id;
       const desc = n.description ? ` — ${n.description}` : '';
-      return [{ text: `${status} ${label}${desc}`, callback_data: `device:${n.node_id}` }];
+      return [{ text: `${status} ${label}${desc}`, callback_data: `worker:${n.node_id}` }];
     });
-    await sendHtml(ctx, '<b>Devices:</b>', {
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await sendHtml(ctx, '<b>Workers:</b>', { reply_markup: { inline_keyboard: buttons } });
   }
-
-  bot.command('devices', handleDevices);
-  bot.command('list', handleDevices);
+  bot.command('workers', handleWorkers);
+  bot.command('devices', handleWorkers);
+  bot.command('list', handleWorkers);
 
   // --- /agents ---
   bot.command('agents', async (ctx) => {
@@ -162,12 +447,39 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     const buttons = agents.map((a) => {
       const online = isNodeOnline(a.node_id) ? '🟢' : '🔴';
+      const caps: string[] = JSON.parse(a.capabilities || '[]');
+      const capsStr = caps.length > 0 ? ` [${caps.join(', ')}]` : '';
       const desc = a.description ? ` - ${a.description}` : '';
-      return [{ text: `${online} ${a.name}${desc}`, callback_data: `call:${a.name}` }];
+      return [{ text: `${online} ${a.name}${desc}${capsStr}`, callback_data: `call:${a.name}` }];
     });
-    await sendHtml(ctx, '<b>Agents:</b> (tap to start)', {
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await sendHtml(ctx, '<b>Agents:</b> (tap to start)', { reply_markup: { inline_keyboard: buttons } });
+  });
+
+  // --- /tasks (P1-1 but useful now) ---
+  bot.command('tasks', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const tasks = getRecentTasksByChatId(ctx.chat!.id, 10);
+    if (tasks.length === 0) {
+      await ctx.reply('No tasks yet.');
+      return;
+    }
+    let text = '<b>Recent tasks:</b>\n\n';
+    for (const t of tasks) {
+      const emoji = statusEmoji(t.status as TaskStatus);
+      const intent = t.intent.length > 50 ? t.intent.slice(0, 50) + '...' : t.intent;
+      const agent = t.agent_name ? ` → ${escapeHtml(t.agent_name)}` : '';
+      const src = t.source === 'mcp' ? ' (MCP)' : '';
+      text += `${emoji} <code>${escapeHtml(t.task_id.slice(0, 12))}</code>${agent}${src}\n   ${escapeHtml(intent)}\n`;
+      if (t.result_summary) {
+        const summary = t.result_summary.length > 60 ? t.result_summary.slice(0, 60) + '...' : t.result_summary;
+        text += `   → ${escapeHtml(summary)}\n`;
+      }
+      if (t.error) {
+        text += `   ❌ ${escapeHtml(t.error)}\n`;
+      }
+      text += '\n';
+    }
+    await sendHtml(ctx, text);
   });
 
   // --- /switch ---
@@ -182,56 +494,47 @@ export function createBot(token: string, allowedUserId: number): Bot {
       const desc = a.description ? ` - ${a.description}` : '';
       return [{ text: `🟢 ${a.name}${desc}`, callback_data: `switch:${a.name}` }];
     });
-    await sendHtml(ctx, '<b>Switch to:</b>', {
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await sendHtml(ctx, '<b>Switch to:</b>', { reply_markup: { inline_keyboard: buttons } });
   });
 
   // --- /status ---
   bot.command('status', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    const chatId = ctx.chat!.id;
-    const session = getActiveSessionByChatId(chatId);
-    const delegate = getDelegateAgent(chatId);
-    const nodes = getAllNodes();
-    const agents = getAllAgents();
-    const onlineNodes = nodes.filter((n) => isNodeOnline(n.node_id));
+    pinnedChatId = ctx.chat!.id;
 
-    let text = '<b>Status</b>\n';
-    text += session
-      ? `Active session: <code>${escapeHtml(session.agentName ?? session.nodeId)}</code>\n`
-      : 'Active session: none\n';
-    text += delegate
-      ? `Default agent: <code>${escapeHtml(delegate)}</code>\n`
-      : 'Default agent: none\n';
-    text += `Devices: ${onlineNodes.length}/${nodes.length} online\n`;
-    text += `Agents: ${agents.length} registered`;
-    await sendHtml(ctx, text);
-  });
-
-  // --- /delegate ---
-  bot.command('delegate', async (ctx) => {
-    if (!guardUser(ctx, allowedUserId)) return;
-    const name = typeof ctx.match === 'string' ? ctx.match.trim() : '';
-
-    if (name === 'off' || name === 'clear') {
-      clearDelegateAgent(ctx.chat!.id);
-      await ctx.reply('Delegate agent cleared.');
-      return;
+    // If no pinned message, create one
+    if (!pinnedMessageId) {
+      const text = '<b>📍 AnyAgent Status</b>\n\nLoading...';
+      try {
+        const msg = await bot.api.sendMessage(ctx.chat!.id, text, { parse_mode: 'HTML' });
+        pinnedMessageId = msg.message_id;
+        await bot.api.pinChatMessage(ctx.chat!.id, msg.message_id, { disable_notification: true }).catch(() => {});
+      } catch { /* ignore */ }
     }
 
+    await updatePinnedStatus();
+    await ctx.reply('Status updated and pinned.');
+  });
+
+  // --- /default ---
+  async function handleDefault(ctx: Context): Promise<void> {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const name = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    if (name === 'off' || name === 'clear') {
+      clearDefaultAgent(ctx.chat!.id);
+      await ctx.reply('Default agent cleared.');
+      return;
+    }
     if (name) {
       const agent = getAgentByName(name);
       if (!agent) {
         await sendHtml(ctx, `❌ Agent <code>${escapeHtml(name)}</code> not found.`);
         return;
       }
-      setDelegateAgent(ctx.chat!.id, name);
+      setDefaultAgent(ctx.chat!.id, name);
       await sendHtml(ctx, `✅ Default agent set to <code>${escapeHtml(name)}</code>. Just type to interact.`);
       return;
     }
-
-    // No arg: show inline keyboard
     const agents = getAllAgents().filter((a) => isNodeOnline(a.node_id));
     if (agents.length === 0) {
       await ctx.reply('No online agents available.');
@@ -239,13 +542,13 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     const buttons = agents.map((a) => {
       const desc = a.description ? ` - ${a.description}` : '';
-      return [{ text: `${a.name}${desc}`, callback_data: `delegate:${a.name}` }];
+      return [{ text: `${a.name}${desc}`, callback_data: `default:${a.name}` }];
     });
-    buttons.push([{ text: '❌ Clear delegate', callback_data: 'delegate:__clear__' }]);
-    await sendHtml(ctx, '<b>Set default agent:</b>', {
-      reply_markup: { inline_keyboard: buttons },
-    });
-  });
+    buttons.push([{ text: '❌ Clear default', callback_data: 'default:__clear__' }]);
+    await sendHtml(ctx, '<b>Set default agent:</b>', { reply_markup: { inline_keyboard: buttons } });
+  }
+  bot.command('default', handleDefault);
+  bot.command('delegate', handleDefault);
 
   // --- /call ---
   bot.command('call', async (ctx) => {
@@ -253,71 +556,22 @@ export function createBot(token: string, allowedUserId: number): Bot {
     const matchText = ctx.match;
     const args = typeof matchText === 'string' ? matchText.trim().split(/\s+/) : [];
     if (args.length < 1 || !args[0]) {
-      await ctx.reply('Usage: /call <agent_name>  or  /call <node_id> <binary> [args...]');
+      await ctx.reply('Usage: /call <agent_name>');
       return;
     }
-
     const agent = getAgentByName(args[0]);
-    if (agent) {
-      await startAgent(ctx, agent);
+    if (!agent) {
+      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(args[0])}</code> not found.`);
       return;
     }
+    // Stop existing session
+    const existing = getActiveSessionByChatId(ctx.chat!.id);
+    if (existing) clearActiveSession(existing.nodeId);
 
-    // Fallback: treat as node_id + binary
-    if (args.length < 2) {
-      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(args[0])}</code> not found. For direct call use: /call <code>&lt;node_id&gt; &lt;binary&gt; [args...]</code>`);
-      return;
-    }
-    const [nodeId, binary, ...rest] = args as [string, string, ...string[]];
-    const ok = sendSpawn(nodeId, binary, rest);
-    if (!ok) {
-      await sendHtml(ctx, `❌ Node <code>${escapeHtml(nodeId)}</code> is not online or not found.`);
-    } else {
-      setActiveSession(nodeId, ctx.chat!.id);
-      await sendHtml(ctx, `✅ Sent spawn(<code>${escapeHtml(binary)}</code>) to <code>${escapeHtml(nodeId)}</code>.\nSend messages here to interact. Use /stop to end.`);
-    }
-  });
-
-  // --- Agent management (kept for manual use) ---
-  bot.command('register', async (ctx) => {
-    if (!guardUser(ctx, allowedUserId)) return;
-    const matchText = ctx.match;
-    const args = typeof matchText === 'string' ? matchText.trim().split(/\s+/) : [];
-    if (args.length < 3 || !args[0]) {
-      await ctx.reply('Usage: /register <name> <node_id> <binary> [args...]');
-      return;
-    }
-    const [name, nodeId, binary, ...rest] = args as [string, string, string, ...string[]];
-    if (!nodeExists(nodeId)) {
-      await sendHtml(ctx, `❌ Node <code>${escapeHtml(nodeId)}</code> not found. Use /devices to see available nodes.`);
-      return;
-    }
-    const existing = getAgentByName(name);
-    if (existing) {
-      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(name)}</code> is already registered. Use /unregister first.`);
-      return;
-    }
-    try {
-      insertAgent(name, nodeId, binary, rest);
-      await sendHtml(ctx, `✅ Agent <code>${escapeHtml(name)}</code> registered: <code>${escapeHtml(binary)}</code> on <code>${escapeHtml(nodeId)}</code>.`);
-    } catch (err) {
-      await ctx.reply(`❌ Failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
-
-  bot.command('unregister', async (ctx) => {
-    if (!guardUser(ctx, allowedUserId)) return;
-    const name = typeof ctx.match === 'string' ? ctx.match.trim() : '';
-    if (!name) {
-      await ctx.reply('Usage: /unregister <name>');
-      return;
-    }
-    const deleted = deleteAgent(name);
-    if (deleted) {
-      await sendHtml(ctx, `✅ Agent <code>${escapeHtml(name)}</code> removed.`);
-    } else {
-      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(name)}</code> not found.`);
-    }
+    const taskId = createTaskId();
+    insertTask(taskId, 'telegram', `/call ${args[0]}`, ctx.chat!.id);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `/call ${args[0]}`, 'explicit');
+    updatePinnedStatus();
   });
 
   // --- /stop ---
@@ -331,6 +585,9 @@ export function createBot(token: string, allowedUserId: number): Bot {
     clearActiveSession(session.nodeId);
     const label = session.agentName ? `Agent <code>${escapeHtml(session.agentName)}</code>` : `Session on <code>${escapeHtml(session.nodeId)}</code>`;
     await sendHtml(ctx, `🛑 ${label} session ended.`);
+    // Process queued tasks
+    processNextQueued(bot, session.nodeId);
+    updatePinnedStatus();
   });
 
   // --- Callback: approve/reject pair ---
@@ -344,12 +601,12 @@ export function createBot(token: string, allowedUserId: number): Bot {
     }
     await ctx.editMessageText(`✅ Approved. Node ID: <code>${escapeHtml(nodeId)}</code>`, { parse_mode: 'HTML' });
     await ctx.answerCallbackQuery({ text: `Approved! Node: ${nodeId}` });
+    updatePinnedStatus();
   });
 
   bot.callbackQuery(/^reject:(.+)$/, async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    const connId = ctx.match[1];
-    rejectPair(connId);
+    rejectPair(ctx.match[1]);
     await ctx.editMessageText('❌ Pair request rejected.');
     await ctx.answerCallbackQuery({ text: 'Rejected.' });
   });
@@ -363,12 +620,14 @@ export function createBot(token: string, allowedUserId: number): Bot {
       await ctx.answerCallbackQuery({ text: 'Agent not found.' });
       return;
     }
-    // Stop existing session if any
     const existing = getActiveSessionByChatId(ctx.chat!.id);
     if (existing) clearActiveSession(existing.nodeId);
 
     await ctx.answerCallbackQuery({ text: `Starting ${agentName}...` });
-    await startAgent(ctx, agent);
+    const taskId = createTaskId();
+    insertTask(taskId, 'telegram', `call:${agentName}`, ctx.chat!.id);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `call:${agentName}`, 'explicit');
+    updatePinnedStatus();
   });
 
   // --- Callback: switch agent ---
@@ -380,16 +639,18 @@ export function createBot(token: string, allowedUserId: number): Bot {
       await ctx.answerCallbackQuery({ text: 'Agent not found.' });
       return;
     }
-    // Stop existing session
     const existing = getActiveSessionByChatId(ctx.chat!.id);
     if (existing) clearActiveSession(existing.nodeId);
 
     await ctx.answerCallbackQuery({ text: `Switching to ${agentName}...` });
-    await startAgent(ctx, agent);
+    const taskId = createTaskId();
+    insertTask(taskId, 'telegram', `switch:${agentName}`, ctx.chat!.id);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `switch:${agentName}`, 'user_selected');
+    updatePinnedStatus();
   });
 
-  // --- Callback: device detail ---
-  bot.callbackQuery(/^device:(.+)$/, async (ctx) => {
+  // --- Callback: worker detail ---
+  bot.callbackQuery(/^worker:(.+)$/, async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
     const nodeId = ctx.match[1];
     const agents = getAllAgents().filter((a) => a.node_id === nodeId);
@@ -400,7 +661,7 @@ export function createBot(token: string, allowedUserId: number): Bot {
     const desc = node?.description ? `\n${escapeHtml(node.description)}` : '';
 
     if (agents.length === 0) {
-      await ctx.editMessageText(`<b>${escapeHtml(name)}</b> ${online}${desc}\n\nNo agents on this device.`, { parse_mode: 'HTML' });
+      await ctx.editMessageText(`<b>${escapeHtml(name)}</b> ${online}${desc}\n\nNo agents on this worker.`, { parse_mode: 'HTML' });
     } else {
       const buttons = agents.map((a) => {
         const agentDesc = a.description ? ` - ${a.description}` : '';
@@ -414,57 +675,138 @@ export function createBot(token: string, allowedUserId: number): Bot {
     await ctx.answerCallbackQuery();
   });
 
-  // --- Callback: delegate agent ---
-  bot.callbackQuery(/^delegate:(.+)$/, async (ctx) => {
+  // --- Callback: default agent ---
+  bot.callbackQuery(/^default:(.+)$/, async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
     const agentName = ctx.match[1];
-
     if (agentName === '__clear__') {
-      clearDelegateAgent(ctx.chat!.id);
-      await ctx.editMessageText('Delegate agent cleared.');
+      clearDefaultAgent(ctx.chat!.id);
+      await ctx.editMessageText('Default agent cleared.');
       await ctx.answerCallbackQuery({ text: 'Cleared.' });
       return;
     }
-
-    setDelegateAgent(ctx.chat!.id, agentName);
+    setDefaultAgent(ctx.chat!.id, agentName);
     await ctx.editMessageText(`✅ Default agent set to <b>${escapeHtml(agentName)}</b>. Just type to interact.`, { parse_mode: 'HTML' });
-    await ctx.answerCallbackQuery({ text: `Delegate: ${agentName}` });
+    await ctx.answerCallbackQuery({ text: `Default: ${agentName}` });
   });
 
-  // --- Plain text → active session or delegate auto-spawn ---
+  // --- Callback: retry task (P0-7) ---
+  bot.callbackQuery(/^retry:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const originalTaskId = ctx.match[1];
+    const original = getTask(originalTaskId);
+    if (!original) {
+      await ctx.answerCallbackQuery({ text: 'Task not found.' });
+      return;
+    }
+    if (!original.agent_name) {
+      await ctx.answerCallbackQuery({ text: 'Cannot retry — no agent associated.' });
+      return;
+    }
+
+    const agent = getAgentByName(original.agent_name);
+    if (!agent) {
+      await ctx.answerCallbackQuery({ text: 'Agent no longer exists.' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Retrying...' });
+
+    const taskId = createTaskId();
+    const retryContext = original.error ? `Previous attempt failed: ${original.error}` : undefined;
+    insertTask(taskId, original.source, original.intent, original.chat_id ?? undefined);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, original.intent, 'explicit', retryContext);
+    updatePinnedStatus();
+  });
+
+  // --- Callback: route to specific agent (from ambiguous routing) ---
+  bot.callbackQuery(/^route:([^:]+):(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const agentName = ctx.match[2];
+    const agent = getAgentByName(agentName);
+    const task = getTask(taskId);
+    if (!agent || !task) {
+      await ctx.answerCallbackQuery({ text: 'Agent or task not found.' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: `Routing to ${agentName}...` });
+    await ctx.editMessageText(`Routing to <code>${escapeHtml(agentName)}</code>...`, { parse_mode: 'HTML' });
+
+    // Context carry (P0-9)
+    const lastCompleted = getLastCompletedTask(ctx.chat!.id);
+    const context = lastCompleted?.result_summary?.slice(0, 500);
+
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'user_selected', context);
+    updatePinnedStatus();
+  });
+
+  // --- Plain text → route via capability matching ---
   bot.on('message:text', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
     const chatId = ctx.chat!.id;
+    const text = ctx.message.text;
 
     // If there's an active session, route input there
     const session = getActiveSessionByChatId(chatId);
     if (session) {
-      const ok = sendTtyInput(session.nodeId, ctx.message.text + '\n');
+      const ok = sendTtyInput(session.nodeId, text + '\n');
       if (!ok) {
-        await ctx.reply('⚠️ Failed to send input — node may be offline.');
+        await ctx.reply('⚠️ Failed to send input — worker may be offline.');
         clearActiveSession(session.nodeId);
       }
       return;
     }
 
-    // No active session: check for delegate agent
-    const delegateName = getDelegateAgent(chatId);
-    if (delegateName) {
-      const agent = getAgentByName(delegateName);
+    // No active session — create a task and route it
+    const taskId = createTaskId();
+    insertTask(taskId, 'telegram', text, chatId);
+
+    // Context carry (P0-9): get last completed task result
+    const lastCompleted = getLastCompletedTask(chatId);
+    const context = lastCompleted?.result_summary?.slice(0, 500);
+
+    // Check default agent first
+    const defaultName = getDefaultAgent(chatId);
+    if (defaultName) {
+      const agent = getAgentByName(defaultName);
       if (!agent) {
-        await sendHtml(ctx, `⚠️ Delegate agent <code>${escapeHtml(delegateName)}</code> no longer exists. Clearing.`);
-        clearDelegateAgent(chatId);
+        await sendHtml(ctx, `⚠️ Default agent <code>${escapeHtml(defaultName)}</code> no longer exists. Clearing.`);
+        clearDefaultAgent(chatId);
+        updateTaskStatus(taskId, 'failed', { error: 'Default agent not found' });
         return;
       }
-      const started = await startAgent(ctx, agent);
-      if (started) {
-        // Send the text as first input
-        sendTtyInput(agent.node_id, ctx.message.text + '\n');
-      }
+      await startAgentForTask(bot, chatId, agent, taskId, text, 'default', context);
+      updatePinnedStatus();
       return;
     }
 
-    // No session, no delegate — ignore
+    // Capability-based routing (P0-5)
+    const result = findAgentByCapability(text);
+    if (!result) {
+      updateTaskStatus(taskId, 'failed', { error: 'No agents available' });
+      await sendHtml(ctx, 'No agents online. Use /workers to check connectivity.');
+      return;
+    }
+
+    if ('agent' in result) {
+      // Clear match — route directly
+      await startAgentForTask(bot, chatId, result.agent, taskId, text, result.method, context);
+      updatePinnedStatus();
+      return;
+    }
+
+    // Ambiguous — ask user to pick
+    updateTaskStatus(taskId, 'routed', { routing_method: 'user_selected' });
+    const buttons = result.agents.map(a => {
+      const caps: string[] = JSON.parse(a.capabilities || '[]');
+      const capsStr = caps.length > 0 ? ` [${caps.join(', ')}]` : '';
+      return [{ text: `${a.name}${capsStr}`, callback_data: `route:${taskId}:${a.name}` }];
+    });
+    await sendHtml(ctx, 'Multiple agents available. Which should handle this?', {
+      reply_markup: { inline_keyboard: buttons },
+    });
   });
 
   return bot;

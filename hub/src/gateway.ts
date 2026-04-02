@@ -12,6 +12,17 @@ import {
   updateNodeDescription,
   deleteAgentsByNodeId,
   upsertAgent,
+  upsertSession,
+  getSessionByNodeId,
+  getSessionByChatId,
+  deleteSessionByNodeId,
+  getAllSessions,
+  touchSession,
+  upsertDefaultAgent,
+  getDefaultAgentByChatId,
+  deleteDefaultAgentByChatId,
+  updateTaskStatus,
+  getRecentTasks,
 } from './db.js';
 import { escapeHtml } from './format.js';
 import type {
@@ -21,6 +32,9 @@ import type {
   AuthRequestParams,
   AuthResponseParams,
   SpawnParams,
+  SpawnResult,
+  ExitParams,
+  OutputParams,
   PendingPair,
   ActiveSession,
   DeclareParams,
@@ -32,16 +46,20 @@ interface WorkerSession {
   nodeId?: string;
   authenticated: boolean;
   challenge?: string;
+  heartbeatTimer?: ReturnType<typeof setInterval>;
+  pongReceived?: boolean;
 }
 
 type TtyCallback = (nodeId: string, data: Buffer) => void;
+type StructuredOutputCallback = (nodeId: string, params: OutputParams) => void;
+type SessionEndCallback = (nodeId: string, exitCode: number) => void;
 
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
 const pendingPairs = new Map<string, PendingPair>();
-const activeSessions = new Map<string, ActiveSession>(); // nodeId → ActiveSession
-const delegateAgents = new Map<number, string>(); // chatId → agentName
 let ttyOutputCallback: TtyCallback | null = null;
+let structuredOutputCallback: StructuredOutputCallback | null = null;
+let sessionEndCallback: SessionEndCallback | null = null;
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -59,6 +77,22 @@ function makeError(id: string | number | undefined, code: number, message: strin
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+function startHeartbeat(session: WorkerSession): void {
+  if (session.heartbeatTimer) return;
+  session.pongReceived = true;
+  session.heartbeatTimer = setInterval(() => {
+    if (!session.pongReceived) {
+      console.log(`[gateway] No pong from ${session.nodeId ?? session.wsId}, terminating`);
+      session.ws.terminate();
+      return;
+    }
+    session.pongReceived = false;
+    session.ws.ping();
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
 export function isNodeOnline(nodeId: string): boolean {
   const id = nodeMap.get(nodeId);
   if (!id) return false;
@@ -66,33 +100,35 @@ export function isNodeOnline(nodeId: string): boolean {
   return session?.authenticated === true;
 }
 
-export function sendSpawn(nodeId: string, binary: string, args: string[] = []): boolean {
+export function sendSpawn(nodeId: string, binary: string, args: string[] = [], taskId?: string, context?: string): boolean {
   const id = nodeMap.get(nodeId);
   if (!id) return false;
   const session = sessions.get(id);
   if (!session?.authenticated) return false;
-  const msg: SpawnParams = { binary, args };
+  const msg: SpawnParams = { binary, args, taskId, context };
   sendJson(session.ws, makeRpc('spawn', msg));
   return true;
 }
 
 export function setActiveSession(nodeId: string, chatId: number, agentName?: string): void {
-  activeSessions.set(nodeId, { nodeId, chatId, agentName });
+  const sessionId = `sess_${randomBytes(4).toString('hex')}`;
+  upsertSession(sessionId, nodeId, chatId, agentName);
 }
 
 export function getActiveSession(nodeId: string): ActiveSession | undefined {
-  return activeSessions.get(nodeId);
+  const row = getSessionByNodeId(nodeId);
+  if (!row) return undefined;
+  return { nodeId: row.node_id, chatId: row.chat_id, agentName: row.agent_name ?? undefined };
 }
 
 export function clearActiveSession(nodeId: string): void {
-  activeSessions.delete(nodeId);
+  deleteSessionByNodeId(nodeId);
 }
 
 export function getActiveSessionByChatId(chatId: number): ActiveSession | undefined {
-  for (const session of activeSessions.values()) {
-    if (session.chatId === chatId) return session;
-  }
-  return undefined;
+  const row = getSessionByChatId(chatId);
+  if (!row) return undefined;
+  return { nodeId: row.node_id, chatId: row.chat_id, agentName: row.agent_name ?? undefined };
 }
 
 export function sendTtyInput(nodeId: string, data: string): boolean {
@@ -101,23 +137,32 @@ export function sendTtyInput(nodeId: string, data: string): boolean {
   const session = sessions.get(id);
   if (!session?.authenticated) return false;
   session.ws.send(Buffer.from(data), { binary: true });
+  touchSession(nodeId);
   return true;
 }
 
-export function setDelegateAgent(chatId: number, agentName: string): void {
-  delegateAgents.set(chatId, agentName);
+export function setDefaultAgent(chatId: number, agentName: string): void {
+  upsertDefaultAgent(chatId, agentName);
 }
 
-export function getDelegateAgent(chatId: number): string | undefined {
-  return delegateAgents.get(chatId);
+export function getDefaultAgent(chatId: number): string | undefined {
+  return getDefaultAgentByChatId(chatId)?.agent_name;
 }
 
-export function clearDelegateAgent(chatId: number): void {
-  delegateAgents.delete(chatId);
+export function clearDefaultAgent(chatId: number): void {
+  deleteDefaultAgentByChatId(chatId);
 }
 
 export function onTtyOutput(callback: TtyCallback): void {
   ttyOutputCallback = callback;
+}
+
+export function onStructuredOutput(callback: StructuredOutputCallback): void {
+  structuredOutputCallback = callback;
+}
+
+export function onSessionEnd(callback: SessionEndCallback): void {
+  sessionEndCallback = callback;
 }
 
 export function createGateway(
@@ -147,12 +192,18 @@ export function createGateway(
     const session: WorkerSession = { ws, wsId: connId, authenticated: false };
     sessions.set(connId, session);
 
+    // Pong handler for heartbeat
+    ws.on('pong', () => {
+      session.pongReceived = true;
+    });
+
     ws.on('message', async (data, isBinary) => {
       if (isBinary) {
         // Binary frames = TTY data; forward to registered callback
         if (session.nodeId && ttyOutputCallback) {
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
           ttyOutputCallback(session.nodeId, buf);
+          touchSession(session.nodeId);
         }
         return;
       }
@@ -167,10 +218,45 @@ export function createGateway(
     });
 
     ws.on('close', () => {
-      if (session.nodeId) nodeMap.delete(session.nodeId);
+      if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
+      if (session.nodeId) {
+        // Notify user if there was an active session on this worker
+        const active = getActiveSession(session.nodeId);
+        if (active) {
+          const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Session';
+          bot.api.sendMessage(active.chatId, `⚠️ ${label} — worker disconnected.`, { parse_mode: 'HTML' }).catch(() => {});
+          clearActiveSession(session.nodeId);
+        }
+        nodeMap.delete(session.nodeId);
+      }
       sessions.delete(connId);
     });
   });
+
+  // Session timeout checker — clean up abandoned sessions
+  const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS ?? '', 10) || 30 * 60 * 1000;
+  setInterval(() => {
+    const allSessions = getAllSessions();
+    const now = Date.now();
+    for (const row of allSessions) {
+      const lastActivity = new Date(row.last_activity_at + 'Z').getTime();
+      if (now - lastActivity > SESSION_TIMEOUT_MS) {
+        // Send kill to worker if online
+        const wsId = nodeMap.get(row.node_id);
+        if (wsId) {
+          const workerSession = sessions.get(wsId);
+          if (workerSession?.authenticated) {
+            sendJson(workerSession.ws, makeRpc('kill', {}));
+          }
+        }
+        // Notify user
+        const label = row.agent_name ? `Agent <code>${escapeHtml(row.agent_name)}</code>` : 'Session';
+        bot.api.sendMessage(row.chat_id, `${label} timed out after inactivity.`, { parse_mode: 'HTML' }).catch(() => {});
+        clearActiveSession(row.node_id);
+        console.log(`[gateway] Session on ${row.node_id} timed out`);
+      }
+    }
+  }, 60_000);
 
   console.log(`[gateway] WebSocket server listening on port ${port}`);
   return wss;
@@ -281,6 +367,7 @@ async function handleMessage(
         session.authenticated = true;
         session.challenge = undefined;
         nodeMap.set(params.nodeId, connId);
+        startHeartbeat(session);
         sendJson(session.ws, makeResult(req.id, { success: true }));
       } catch (err) {
         console.error('[gateway] Signature verification error:', err);
@@ -289,16 +376,66 @@ async function handleMessage(
       break;
     }
 
-    case 'spawn_result':
-      console.log(`[gateway] Received ${req.method} from node ${session.nodeId}:`, req.params);
-      break;
-
-    case 'exit':
-      console.log(`[gateway] Received ${req.method} from node ${session.nodeId}:`, req.params);
-      if (session.nodeId) {
-        activeSessions.delete(session.nodeId);
+    case 'spawn_result': {
+      const params = req.params as SpawnResult;
+      console.log(`[gateway] spawn_result from node ${session.nodeId}:`, params);
+      if (!params.success && session.nodeId) {
+        const active = getActiveSession(session.nodeId);
+        if (active) {
+          const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Process';
+          const reason = params.error ? `: ${escapeHtml(params.error)}` : '';
+          bot.api.sendMessage(active.chatId, `❌ ${label} failed to start${reason}`, { parse_mode: 'HTML' }).catch(() => {});
+          clearActiveSession(session.nodeId);
+        }
       }
       break;
+    }
+
+    case 'exit': {
+      const params = req.params as ExitParams;
+      console.log(`[gateway] exit from node ${session.nodeId}: code=${params.code}`);
+      if (session.nodeId) {
+        const active = getActiveSession(session.nodeId);
+        if (active) {
+          const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Session';
+          const codeStr = params.code === 0 ? 'normally' : `with code ${params.code}`;
+          bot.api.sendMessage(active.chatId, `${label} exited ${codeStr}.`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+        // Mark any running tasks on this node as complete/failed (legacy TTY agents don't send structured output)
+        const recentTasks = getRecentTasks(20);
+        for (const task of recentTasks) {
+          if (task.node_id === session.nodeId && task.status === 'running') {
+            if (params.code === 0) {
+              updateTaskStatus(task.task_id, 'complete');
+            } else {
+              updateTaskStatus(task.task_id, 'failed', { error: `Process exited with code ${params.code}` });
+            }
+          }
+        }
+        clearActiveSession(session.nodeId);
+        // Notify bot to process queued tasks
+        if (sessionEndCallback) sessionEndCallback(session.nodeId, params.code);
+      }
+      break;
+    }
+
+    case 'output': {
+      if (!session.authenticated || !session.nodeId) return;
+      const params = req.params as OutputParams;
+      // Update task status based on output type
+      if (params.type === 'result') {
+        const payload = params.payload as { text?: string };
+        updateTaskStatus(params.taskId, 'complete', { result_summary: payload.text ?? '' });
+      } else if (params.type === 'error') {
+        const payload = params.payload as { message?: string };
+        updateTaskStatus(params.taskId, 'failed', { error: payload.message ?? 'Unknown error' });
+      }
+      // Forward to callback (bot.ts will render to Telegram)
+      if (structuredOutputCallback) {
+        structuredOutputCallback(session.nodeId, params);
+      }
+      break;
+    }
 
     case 'declare': {
       if (!session.authenticated || !session.nodeId) {
@@ -311,9 +448,10 @@ async function handleMessage(
       // Replace all agents for this node
       deleteAgentsByNodeId(session.nodeId);
       for (const agent of params.agents ?? []) {
-        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description);
+        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description, agent.capabilities);
       }
-      console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s)`);
+      const pv = params.protocolVersion ?? 1;
+      console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s), protocol v${pv}`);
       sendJson(session.ws, makeResult(req.id, { success: true }));
       break;
     }
@@ -334,6 +472,7 @@ export function approvePair(connId: string): string | null {
     session.nodeId = nodeId;
     session.authenticated = true;
     nodeMap.set(nodeId, connId);
+    startHeartbeat(session);
     sendJson(session.ws, makeRpc('pair_result', { nodeId, success: true }));
   }
   return nodeId;

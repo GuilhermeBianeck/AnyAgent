@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { NodeRow, PairCodeRow, AgentRow } from './types.js';
+import type { NodeRow, PairCodeRow, AgentRow, SessionRow, DefaultAgentRow, TaskRow, TaskStatus, TaskSource, RoutingMethod } from './types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(__dirname, '..', 'data');
@@ -38,9 +38,42 @@ db.exec(`
   );
 `);
 
-// Idempotent migrations: add description columns
+// Idempotent migrations
 try { db.exec(`ALTER TABLE nodes ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
+
+// Session and default agent persistence
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    agent_name TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS default_agents (
+    chat_id INTEGER PRIMARY KEY,
+    agent_name TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL DEFAULT 'telegram',
+    chat_id INTEGER,
+    intent TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    routing_method TEXT,
+    agent_name TEXT,
+    node_id TEXT,
+    result_summary TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
 
 // Pair code operations
 export function insertPairCode(code: string, expiresAt: Date, wsId: string): void {
@@ -96,10 +129,10 @@ export function insertAgent(name: string, nodeId: string, binary: string, args: 
   ).run(name, nodeId, binary, JSON.stringify(args), description ?? '');
 }
 
-export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string): void {
+export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[]): void {
   db.prepare(
-    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description) VALUES (?, ?, ?, ?, ?)`
-  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '');
+    `INSERT OR REPLACE INTO agents (name, node_id, binary, args_json, description, capabilities) VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '', JSON.stringify(capabilities ?? []));
 }
 
 export function deleteAgentsByNodeId(nodeId: string): void {
@@ -121,4 +154,90 @@ export function getAllAgents(): AgentRow[] {
 export function deleteAgent(name: string): boolean {
   const result = db.prepare(`DELETE FROM agents WHERE name = ?`).run(name);
   return result.changes > 0;
+}
+
+// Session operations
+export function upsertSession(sessionId: string, nodeId: string, chatId: number, agentName?: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO sessions (session_id, node_id, chat_id, agent_name, started_at, last_activity_at)
+     VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))`
+  ).run(sessionId, nodeId, chatId, agentName ?? null);
+}
+
+export function getSessionByNodeId(nodeId: string): SessionRow | undefined {
+  return db.prepare(`SELECT * FROM sessions WHERE node_id = ?`).get(nodeId) as SessionRow | undefined;
+}
+
+export function getSessionByChatId(chatId: number): SessionRow | undefined {
+  return db.prepare(`SELECT * FROM sessions WHERE chat_id = ?`).get(chatId) as SessionRow | undefined;
+}
+
+export function deleteSessionByNodeId(nodeId: string): void {
+  db.prepare(`DELETE FROM sessions WHERE node_id = ?`).run(nodeId);
+}
+
+export function getAllSessions(): SessionRow[] {
+  return db.prepare(`SELECT * FROM sessions`).all() as SessionRow[];
+}
+
+export function touchSession(nodeId: string): void {
+  db.prepare(`UPDATE sessions SET last_activity_at = datetime('now') WHERE node_id = ?`).run(nodeId);
+}
+
+// Default agent operations
+export function upsertDefaultAgent(chatId: number, agentName: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO default_agents (chat_id, agent_name) VALUES (?, ?)`
+  ).run(chatId, agentName);
+}
+
+export function getDefaultAgentByChatId(chatId: number): DefaultAgentRow | undefined {
+  return db.prepare(`SELECT * FROM default_agents WHERE chat_id = ?`).get(chatId) as DefaultAgentRow | undefined;
+}
+
+export function deleteDefaultAgentByChatId(chatId: number): void {
+  db.prepare(`DELETE FROM default_agents WHERE chat_id = ?`).run(chatId);
+}
+
+// Task operations
+export function insertTask(taskId: string, source: TaskSource, intent: string, chatId?: number): void {
+  db.prepare(
+    `INSERT INTO tasks (task_id, source, chat_id, intent, status) VALUES (?, ?, ?, ?, 'submitted')`
+  ).run(taskId, source, chatId ?? null, intent);
+}
+
+export function getTask(taskId: string): TaskRow | undefined {
+  return db.prepare(`SELECT * FROM tasks WHERE task_id = ?`).get(taskId) as TaskRow | undefined;
+}
+
+export function updateTaskStatus(taskId: string, status: TaskStatus, extra?: { agent_name?: string; node_id?: string; routing_method?: RoutingMethod; result_summary?: string; error?: string }): void {
+  const sets = [`status = ?`, `updated_at = datetime('now')`];
+  const values: unknown[] = [status];
+  if (extra?.agent_name !== undefined) { sets.push('agent_name = ?'); values.push(extra.agent_name); }
+  if (extra?.node_id !== undefined) { sets.push('node_id = ?'); values.push(extra.node_id); }
+  if (extra?.routing_method !== undefined) { sets.push('routing_method = ?'); values.push(extra.routing_method); }
+  if (extra?.result_summary !== undefined) { sets.push('result_summary = ?'); values.push(extra.result_summary); }
+  if (extra?.error !== undefined) { sets.push('error = ?'); values.push(extra.error); }
+  values.push(taskId);
+  db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE task_id = ?`).run(...values);
+}
+
+export function getRecentTasks(limit: number = 10): TaskRow[] {
+  return db.prepare(`SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`).all(limit) as TaskRow[];
+}
+
+export function getRecentTasksByChatId(chatId: number, limit: number = 10): TaskRow[] {
+  return db.prepare(`SELECT * FROM tasks WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`).all(chatId, limit) as TaskRow[];
+}
+
+export function getLastCompletedTask(chatId: number): TaskRow | undefined {
+  return db.prepare(`SELECT * FROM tasks WHERE chat_id = ? AND status = 'complete' ORDER BY updated_at DESC LIMIT 1`).get(chatId) as TaskRow | undefined;
+}
+
+export function getQueuedTasksByNodeId(nodeId: string): TaskRow[] {
+  return db.prepare(`SELECT * FROM tasks WHERE node_id = ? AND status = 'queued' ORDER BY created_at ASC`).all(nodeId) as TaskRow[];
+}
+
+export function cleanOldTasks(daysToKeep: number = 30): void {
+  db.prepare(`DELETE FROM tasks WHERE created_at < datetime('now', '-' || ? || ' days')`).run(daysToKeep);
 }

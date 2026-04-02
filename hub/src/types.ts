@@ -49,6 +49,8 @@ export interface AuthResult {
 export interface SpawnParams {
   binary: string;
   args?: string[];
+  taskId?: string;
+  context?: string;
 }
 
 export interface SpawnResult {
@@ -64,6 +66,13 @@ export interface ResizeParams {
 
 export interface ExitParams {
   code: number;
+}
+
+// Structured output (v2, worker → hub)
+export interface OutputParams {
+  taskId: string;
+  type: 'status' | 'progress' | 'result' | 'error';
+  payload: Record<string, unknown>;
 }
 
 // DB row types
@@ -92,7 +101,28 @@ export interface AgentRow {
   binary: string;
   args_json: string; // JSON-encoded string[]
   description: string;
+  capabilities: string; // JSON-encoded string[] (v2)
   created_at: string;
+}
+
+// Task row (v2)
+export type TaskStatus = 'submitted' | 'queued' | 'routed' | 'running' | 'complete' | 'failed' | 'timeout';
+export type TaskSource = 'telegram' | 'mcp';
+export type RoutingMethod = 'default' | 'single' | 'matched' | 'explicit' | 'user_selected';
+
+export interface TaskRow {
+  task_id: string;
+  source: TaskSource;
+  chat_id: number | null;
+  intent: string;
+  status: TaskStatus;
+  routing_method: RoutingMethod | null;
+  agent_name: string | null;
+  node_id: string | null;
+  result_summary: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // Active session (in-memory)
@@ -111,9 +141,31 @@ export interface PendingPair {
   description?: string;
 }
 
-// Worker self-declaration payload
+// Session persistence
+export interface SessionRow {
+  session_id: string;
+  node_id: string;
+  chat_id: number;
+  agent_name: string | null;
+  started_at: string;
+  last_activity_at: string;
+}
+
+export interface DefaultAgentRow {
+  chat_id: number;
+  agent_name: string;
+}
+
+// Worker self-declaration payload (v2: with capabilities + protocolVersion)
 export interface DeclareParams {
   name: string;
   description: string;
-  agents: Array<{ name: string; binary: string; args: string[]; description: string }>;
+  protocolVersion?: number; // 1 = v1, 2 = v2 (optional for backward compat)
+  agents: Array<{
+    name: string;
+    binary: string;
+    args: string[];
+    description: string;
+    capabilities?: string[]; // v2
+  }>;
 }
