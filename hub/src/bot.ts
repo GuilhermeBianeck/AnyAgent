@@ -1,36 +1,33 @@
 import { Bot, Context } from 'grammy';
+import {
+  createTaskId, findAgentByCapability, startAgentForTask,
+  processNextQueued, handleApprovalDecision, generatePairCode,
+  approveWorkerPairing, rejectWorkerPairing, revokeWorker,
+  getWorkerList, getAgentList, getRecentTasks, getTask,
+  getActiveSessionByChatId, clearActiveSession, sendTtyInput,
+  setDefaultAgent, getDefaultAgent, clearDefaultAgent,
+  getApprovalMode, setApprovalMode, purgeTasksByChatId,
+  getActiveSession,
+} from './manager.js';
 import { randomBytes } from 'crypto';
 import {
-  insertPairCode, getAllNodes, getAgentByName, getAllAgents,
-  insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
-  getQueuedTasksByNodeId, getRunningTasksByNodeId,
-  purgeTasksByChatId, revokeNode,
-  getApprovalMode, setApprovalMode, isAgentTrusted, setAgentTrusted,
+  getAgentByName, insertTask, updateTaskStatus, getRunningTasksByNodeId,
+  insertPairCode, getRecentTasksByChatId, getAllNodes, getAllAgents,
+  setAgentTrusted,
 } from './db.js';
 import {
   isNodeOnline,
-  sendSpawn,
   approvePair,
   rejectPair,
   onTtyOutput,
   onStructuredOutput,
   onSessionEnd,
-  setActiveSession,
-  getActiveSession,
-  getActiveSessionByChatId,
-  clearActiveSession,
-  sendTtyInput,
-  setDefaultAgent,
-  getDefaultAgent,
-  clearDefaultAgent,
   onPairingRequest,
 } from './gateway.js';
 import { escapeHtml } from './format.js';
 import { stripAnsi } from './output.js';
-import { getContext, setContext, appendContext, clearContext, buildSpawnContext } from './context.js';
-import type { AgentRow, OutputParams, TaskStatus } from './types.js';
-
-const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH ?? '3', 10);
+import { getContext, setContext, appendContext, clearContext } from './context.js';
+import type { OutputParams, TaskStatus } from './types.js';
 
 function guardUser(ctx: Context, allowedUserId: number): boolean {
   if (ctx.from?.id !== allowedUserId) {
@@ -71,154 +68,43 @@ async function sendHtmlDirect(bot: Bot, chatId: number, html: string, extra: Rec
   }
 }
 
-// --- Capability-based routing (P0-5) ---
-function findAgentByCapability(intent: string): { agent: AgentRow; method: 'default' | 'single' | 'matched' } | { agents: AgentRow[]; method: 'ambiguous' } | null {
-  const agents = getAllAgents();
-  const onlineAgents = agents.filter(a => isNodeOnline(a.node_id));
-  if (onlineAgents.length === 0) return null;
-  if (onlineAgents.length === 1) return { agent: onlineAgents[0], method: 'single' };
-
-  const intentWords = intent.toLowerCase().split(/\s+/);
-  const scored: Array<{ agent: AgentRow; score: number }> = [];
-
-  for (const agent of onlineAgents) {
-    const capabilities: string[] = JSON.parse(agent.capabilities || '[]');
-    let score = 0;
-    for (const cap of capabilities) {
-      const capLower = cap.toLowerCase();
-      for (const word of intentWords) {
-        if (word.length >= 3 && (word.includes(capLower) || capLower.includes(word))) {
-          score++;
-        }
-      }
-    }
-    scored.push({ agent, score });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  if (scored[0].score > 0 && (scored.length === 1 || scored[0].score > scored[1].score)) {
-    return { agent: scored[0].agent, method: 'matched' };
-  }
-
-  // Ambiguous or no match — return all online for user selection
-  return { agents: onlineAgents, method: 'ambiguous' };
-}
-
-// --- Task-aware agent start ---
-function createTaskId(): string {
-  return `task_${randomBytes(6).toString('hex')}`;
-}
-
-async function startAgentForTask(
-  bot: Bot,
-  chatId: number,
-  agent: AgentRow,
-  taskId: string,
-  intent: string,
-  routingMethod: 'default' | 'single' | 'matched' | 'explicit' | 'user_selected'
-): Promise<boolean> {
-  if (!isNodeOnline(agent.node_id)) {
-    updateTaskStatus(taskId, 'failed', { error: 'Worker offline', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(agent.name)}</code> — worker is offline.`);
-    return false;
-  }
-
-  // Approval gate — check if this task needs human approval before spawning
-  // Skip if task was already approved (status reset to 'submitted' by approval callback)
-  const currentTask = getTask(taskId);
-  const wasAlreadyApproved = currentTask?.status === 'submitted' && currentTask?.routing_method !== null;
-  const approvalMode = getApprovalMode(chatId);
-  const needsApproval =
-    !wasAlreadyApproved &&
-    ((approvalMode === 'always') ||
-     (approvalMode === 'mcp' && routingMethod !== 'explicit' && routingMethod !== 'default'));
-  if (needsApproval && !isAgentTrusted(agent.name)) {
-    updateTaskStatus(taskId, 'pending_approval', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    const intentPreview = intent.length > 80 ? intent.slice(0, 80) + '...' : intent;
-    await sendHtmlDirect(bot, chatId,
-      `📋 <b>Task approval required</b>\n<i>${escapeHtml(intentPreview)}</i>\n→ <code>${escapeHtml(agent.name)}</code>`, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '✅ Approve', callback_data: `taskapprove:${taskId}` }],
-            [{ text: '🔓 Always Allow Agent', callback_data: `tasttrust:${taskId}` }],
-            [{ text: '❌ Deny', callback_data: `taskdeny:${taskId}` }],
-          ],
-        },
+// --- Helper to render TaskStartResult from manager to Telegram ---
+async function renderTaskStart(bot: Bot, chatId: number, result: ReturnType<typeof startAgentForTask>, taskId: string): Promise<void> {
+  switch (result.outcome) {
+    case 'started':
+      await sendHtmlDirect(bot, chatId, `✅ <code>${escapeHtml(result.agentName)}</code> started. Send messages to interact. /stop to end.`);
+      break;
+    case 'queued':
+      await sendHtmlDirect(bot, chatId, `⏳ <code>${escapeHtml(result.agentName)}</code> is busy. Queued (position #${result.queuePosition}).`, {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cancel:${taskId}` }]] },
       });
-    // Auto-deny after 5 minutes
-    setTimeout(() => {
-      const t = getTask(taskId);
-      if (t && t.status === 'pending_approval') {
-        updateTaskStatus(taskId, 'failed', { error: 'Approval timed out' });
-      }
-    }, 5 * 60 * 1000);
-    return true; // Task created, waiting for approval
-  }
-
-  // Check queue (P0-6)
-  const existingSession = getActiveSession(agent.node_id);
-  if (existingSession) {
-    const queued = getQueuedTasksByNodeId(agent.node_id);
-    if (queued.length >= MAX_QUEUE_DEPTH) {
-      updateTaskStatus(taskId, 'failed', { error: `Queue full (${MAX_QUEUE_DEPTH})`, agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(agent.name)}</code> is busy and queue is full (${MAX_QUEUE_DEPTH}). Try again later.`);
-      return false;
+      break;
+    case 'pending_approval': {
+      const task = getTask(taskId);
+      const intentPreview = (task?.intent ?? '').length > 80 ? (task?.intent ?? '').slice(0, 80) + '...' : (task?.intent ?? '');
+      await sendHtmlDirect(bot, chatId,
+        `📋 <b>Task approval required</b>\n<i>${escapeHtml(intentPreview)}</i>\n→ <code>${escapeHtml(result.agentName)}</code>`, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '✅ Approve', callback_data: `taskapprove:${taskId}` }],
+              [{ text: '🔓 Always Allow Agent', callback_data: `tasttrust:${taskId}` }],
+              [{ text: '❌ Deny', callback_data: `taskdeny:${taskId}` }],
+            ],
+          },
+        });
+      break;
     }
-    updateTaskStatus(taskId, 'queued', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    const position = queued.length + 1;
-    await sendHtmlDirect(bot, chatId, `⏳ Agent <code>${escapeHtml(agent.name)}</code> is busy. Task queued (position #${position}).`, {
-      reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cancel:${taskId}` }]] },
-    });
-    return true; // Queued, will start later
-  }
-
-  const agentArgs: string[] = JSON.parse(agent.args_json);
-  // Build full context for context-aware agents
-  const isContextAware = agent.context_aware !== 0;
-  const spawnContext = isContextAware ? buildSpawnContext(chatId, intent) : intent;
-  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, taskId, spawnContext);
-  if (!ok) {
-    updateTaskStatus(taskId, 'failed', { error: 'Failed to spawn', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    await sendHtmlDirect(bot, chatId, `❌ Failed to spawn agent <code>${escapeHtml(agent.name)}</code>.`, {
-      reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
-    });
-    return false;
-  }
-
-  setActiveSession(agent.node_id, chatId, agent.name);
-  updateTaskStatus(taskId, 'running', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-  await sendHtmlDirect(bot, chatId, `✅ <code>${escapeHtml(agent.name)}</code> started. Send messages to interact. /stop to end.`);
-  return true;
-}
-
-// --- Process next queued task for a node ---
-// Iterative (not recursive) queue processing — prevents stack overflow
-async function processNextQueued(bot: Bot, nodeId: string): Promise<void> {
-  while (true) {
-    const queued = getQueuedTasksByNodeId(nodeId);
-    if (queued.length === 0) return;
-
-    const next = queued[0];
-    const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
-    if (!agent || !next.chat_id) {
-      updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
-      continue; // try next
-    }
-
-    const agentArgs: string[] = JSON.parse(agent.args_json);
-    const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, next.intent);
-    if (!ok) {
-      updateTaskStatus(next.task_id, 'failed', { error: 'Failed to spawn from queue' });
-      await sendHtmlDirect(bot, next.chat_id, `❌ Queued task failed to start on <code>${escapeHtml(agent.name)}</code>.`, {
-        reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${next.task_id}` }]] },
+    case 'offline':
+      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(result.agentName)}</code> — worker is offline.`);
+      break;
+    case 'queue_full':
+      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(result.agentName)}</code> — queue is full.`);
+      break;
+    case 'failed':
+      await sendHtmlDirect(bot, chatId, `❌ Failed to start <code>${escapeHtml(result.agentName)}</code>.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
       });
-      continue; // try next
-    }
-
-    setActiveSession(agent.node_id, next.chat_id, agent.name);
-    updateTaskStatus(next.task_id, 'running');
-    await sendHtmlDirect(bot, next.chat_id, `▶️ Queued task started on <code>${escapeHtml(agent.name)}</code>.`);
-    return; // successfully started one task, stop
+      break;
   }
 }
 
@@ -374,7 +260,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
 
   // --- Session end → process queue + update status ---
   onSessionEnd((nodeId, _exitCode) => {
-    processNextQueued(bot, nodeId);
+    { const _qr = processNextQueued(nodeId); if (_qr.outcome === "started" && _qr.chatId) sendHtmlDirect(bot, _qr.chatId, `▶️ Queued task started on <code>${escapeHtml(_qr.agentName ?? "")}</code>.`); }
     updatePinnedStatus();
   });
 
@@ -646,7 +532,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
 
     const taskId = createTaskId();
     insertTask(taskId, 'telegram', `/call ${args[0]}`, ctx.chat!.id);
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `/call ${args[0]}`, 'explicit');
+    { const r = startAgentForTask(agent, taskId, `/call ${args[0]}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, r, taskId); }
     updatePinnedStatus();
   });
 
@@ -662,7 +548,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     const label = session.agentName ? `Agent <code>${escapeHtml(session.agentName)}</code>` : `Session on <code>${escapeHtml(session.nodeId)}</code>`;
     await sendHtml(ctx, `🛑 ${label} session ended.`);
     // Process queued tasks
-    processNextQueued(bot, session.nodeId);
+    { const _qr = processNextQueued(session.nodeId); if (_qr.outcome === "started" && _qr.chatId) sendHtmlDirect(bot, _qr.chatId, `▶️ Queued task started on <code>${escapeHtml(_qr.agentName ?? "")}</code>.`); }
     updatePinnedStatus();
   });
 
@@ -708,7 +594,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       await ctx.reply('Usage: /revoke <node_id>');
       return;
     }
-    const revoked = revokeNode(nodeId);
+    const revoked = revokeWorker(nodeId);
     if (revoked) {
       await sendHtml(ctx, `✅ Node <code>${escapeHtml(nodeId)}</code> revoked. All agents removed.`);
       updatePinnedStatus();
@@ -754,7 +640,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       return;
     }
     updateTaskStatus(taskId, 'submitted'); // reset to submitted so startAgentForTask can proceed
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'explicit');
+    { const _r = startAgentForTask(agent, taskId, task.intent, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -777,7 +663,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       return;
     }
     updateTaskStatus(taskId, 'submitted');
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'explicit');
+    { const _r = startAgentForTask(agent, taskId, task.intent, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -884,7 +770,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     await ctx.answerCallbackQuery({ text: `Starting ${agentName}...` });
     const taskId = createTaskId();
     insertTask(taskId, 'telegram', `call:${agentName}`, ctx.chat!.id);
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `call:${agentName}`, 'explicit');
+    { const _r = startAgentForTask(agent, taskId, `call:${agentName}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -903,7 +789,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     await ctx.answerCallbackQuery({ text: `Switching to ${agentName}...` });
     const taskId = createTaskId();
     insertTask(taskId, 'telegram', `switch:${agentName}`, ctx.chat!.id);
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, `switch:${agentName}`, 'user_selected');
+    { const _r = startAgentForTask(agent, taskId, `switch:${agentName}`, ctx.chat!.id, 'user_selected'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -982,7 +868,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       ? `${original.intent}\n[Previous attempt failed: ${original.error}]`
       : original.intent;
     insertTask(taskId, original.source, retryIntent, original.chat_id ?? undefined, original.retry_count + 1);
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, retryIntent, 'explicit');
+    { const _r = startAgentForTask(agent, taskId, retryIntent, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -1015,7 +901,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     await ctx.answerCallbackQuery({ text: `Routing to ${agentName}...` });
     await ctx.editMessageText(`Routing to <code>${escapeHtml(agentName)}</code>...`, { parse_mode: 'HTML' });
 
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'user_selected');
+    { const _r = startAgentForTask(agent, taskId, task.intent, ctx.chat!.id, 'user_selected'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -1050,29 +936,29 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
         updateTaskStatus(taskId, 'failed', { error: 'Default agent not found' });
         return;
       }
-      await startAgentForTask(bot, chatId, agent, taskId, text, 'default');
+      { const _r = startAgentForTask(agent, taskId, text, chatId, 'default'); await renderTaskStart(bot, chatId, _r, taskId); }
       updatePinnedStatus();
       return;
     }
 
     // Capability-based routing (P0-5)
     const result = findAgentByCapability(text);
-    if (!result) {
+    if (result.type === 'none') {
       updateTaskStatus(taskId, 'failed', { error: 'No agents available' });
       await sendHtml(ctx, 'No agents online. Use /workers to check connectivity.');
       return;
     }
 
-    if ('agent' in result) {
+    if (result.type === 'matched' || result.type === 'single') {
       // Clear match — route directly
-      await startAgentForTask(bot, chatId, result.agent, taskId, text, result.method);
+      { const _r = startAgentForTask(result.agent!, taskId, text, chatId, result.method); await renderTaskStart(bot, chatId, _r, taskId); }
       updatePinnedStatus();
       return;
     }
 
     // Ambiguous — ask user to pick
     updateTaskStatus(taskId, 'routed', { routing_method: 'user_selected' });
-    const buttons = result.agents.map(a => {
+    const buttons = (result.agents ?? []).map(a => {
       const caps: string[] = JSON.parse(a.capabilities || '[]');
       const capsStr = caps.length > 0 ? ` [${caps.join(', ')}]` : '';
       return [{ text: `${a.name}${capsStr}`, callback_data: `route:${taskId}:${a.name}` }];

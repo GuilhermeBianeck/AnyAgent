@@ -2,80 +2,21 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { randomBytes, timingSafeEqual } from 'crypto';
-import { getAllAgents, insertTask, updateTaskStatus, getTask, getQueuedTasksByNodeId } from './db.js';
-import { isNodeOnline, sendSpawn, getActiveSession, setActiveSession } from './gateway.js';
+import { timingSafeEqual } from 'crypto';
+import { getTask } from './db.js';
+import {
+  findAgentByCapability, createTaskId, startAgentForTask,
+  getAgentList, getWorkerList,
+} from './manager.js';
 import { getContext } from './context.js';
-import type { AgentRow, TaskRow } from './types.js';
+import type { TaskRow } from './types.js';
+import { insertTask, updateTaskStatus } from './db.js';
 
 type McpTaskCallback = (task: TaskRow) => void;
 let onMcpTaskCallback: McpTaskCallback | null = null;
 
 export function onMcpTask(callback: McpTaskCallback): void {
   onMcpTaskCallback = callback;
-}
-
-function findAgentByCapability(intent: string): AgentRow | undefined {
-  const agents = getAllAgents();
-  const onlineAgents = agents.filter(a => isNodeOnline(a.node_id));
-  if (onlineAgents.length === 0) return undefined;
-  if (onlineAgents.length === 1) return onlineAgents[0];
-
-  const intentWords = intent.toLowerCase().split(/\s+/);
-  let bestMatch: AgentRow | undefined;
-  let bestScore = 0;
-
-  for (const agent of onlineAgents) {
-    const capabilities: string[] = JSON.parse(agent.capabilities || '[]');
-    let score = 0;
-    for (const cap of capabilities) {
-      const capLower = cap.toLowerCase();
-      for (const word of intentWords) {
-        if (word.length >= 3 && (word.includes(capLower) || capLower.includes(word))) {
-          score++;
-        }
-      }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = agent;
-    }
-  }
-
-  return bestMatch ?? onlineAgents[0];
-}
-
-const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH ?? '3', 10);
-
-function spawnAgentTaskSync(agent: AgentRow, intent: string, routingMethod: 'matched' | 'explicit' = 'matched'): { taskId: string; status: 'running' | 'queued' | 'failed' } {
-  const taskId = `task_${randomBytes(6).toString('hex')}`;
-  insertTask(taskId, 'mcp', intent);
-
-  const existingSession = getActiveSession(agent.node_id);
-  if (existingSession) {
-    const queued = getQueuedTasksByNodeId(agent.node_id);
-    if (queued.length >= MAX_QUEUE_DEPTH) {
-      updateTaskStatus(taskId, 'failed', { error: `Queue full (${MAX_QUEUE_DEPTH})`, agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-      return { taskId, status: 'failed' };
-    }
-    updateTaskStatus(taskId, 'queued', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    const task = getTask(taskId);
-    if (task && onMcpTaskCallback) onMcpTaskCallback(task);
-    return { taskId, status: 'queued' };
-  }
-
-  const agentArgs: string[] = JSON.parse(agent.args_json);
-  const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, taskId, intent);
-  if (!ok) {
-    updateTaskStatus(taskId, 'failed', { error: 'Failed to spawn', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-    return { taskId, status: 'failed' };
-  }
-
-  setActiveSession(agent.node_id, 0, agent.name);
-  updateTaskStatus(taskId, 'running', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
-  const task = getTask(taskId);
-  if (task && onMcpTaskCallback) onMcpTaskCallback(task);
-  return { taskId, status: 'running' };
 }
 
 async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow | null> {
@@ -90,37 +31,51 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
   return null;
 }
 
-async function handleToolCall(agent: AgentRow, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit'): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
-  if (!isNodeOnline(agent.node_id)) {
-    return { content: [{ type: 'text', text: `Agent ${agent.name} is offline.` }], isError: true };
+async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit'): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+  const { getAgentByName } = await import('./db.js');
+  const agent = getAgentByName(agentName);
+  if (!agent) {
+    return { content: [{ type: 'text', text: `Agent ${agentName} not found.` }], isError: true };
   }
 
-  const { taskId, status } = spawnAgentTaskSync(agent, intent, routingMethod);
+  const taskId = createTaskId();
+  insertTask(taskId, 'mcp', intent);
 
-  if (status === 'failed') {
-    return { content: [{ type: 'text', text: `Failed to spawn ${agent.name}.` }], isError: true };
+  // Use manager.startAgentForTask — includes approval gate + context injection
+  const result = startAgentForTask(agent, taskId, intent, 0, routingMethod);
+
+  // Notify via callback
+  if (result.outcome !== 'offline' && result.outcome !== 'queue_full') {
+    const task = getTask(taskId);
+    if (task && onMcpTaskCallback) onMcpTaskCallback(task);
   }
 
-  if (timeoutMs && timeoutMs > 0 && (status === 'running' || status === 'queued')) {
-    const result = await waitForTask(taskId, timeoutMs);
-    if (result) {
-      if (result.status === 'complete') {
-        return { content: [{ type: 'text', text: result.result_summary ?? 'Task completed (no output).' }] };
+  if (result.outcome === 'failed' || result.outcome === 'offline' || result.outcome === 'queue_full') {
+    return { content: [{ type: 'text', text: `Failed: ${result.error ?? result.outcome}` }], isError: true };
+  }
+
+  // Blocking mode
+  if (timeoutMs && timeoutMs > 0) {
+    const completed = await waitForTask(taskId, timeoutMs);
+    if (completed) {
+      if (completed.status === 'complete') {
+        return { content: [{ type: 'text', text: completed.result_summary ?? 'Task completed.' }] };
       }
-      if (result.status === 'failed') {
-        return { content: [{ type: 'text', text: `Task failed: ${result.error ?? 'unknown error'}` }], isError: true };
-      }
+      return { content: [{ type: 'text', text: `Task failed: ${completed.error ?? 'unknown'}` }], isError: true };
     }
     return { content: [{ type: 'text', text: `Task ${taskId} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
   }
 
-  if (status === 'queued') {
-    return { content: [{ type: 'text', text: `Agent ${agent.name} is busy. Task ${taskId} queued. Use anyagent_task_status to check.` }] };
-  }
-  return { content: [{ type: 'text', text: `Task ${taskId} started on ${agent.name}. Use anyagent_task_status to check.` }] };
+  // Async mode
+  const statusMsg = result.outcome === 'queued'
+    ? `Agent busy. Task ${taskId} queued.`
+    : result.outcome === 'pending_approval'
+    ? `Task ${taskId} pending approval. Use anyagent_task_status to check.`
+    : `Task ${taskId} started on ${result.agentName}.`;
+  return { content: [{ type: 'text', text: `${statusMsg} Use anyagent_task_status to check.` }] };
 }
 
-// --- Tool registration functions (called per-request on fresh McpServer instances) ---
+// --- Tool registration functions ---
 
 function registerStaticTools(server: McpServer): void {
   server.tool(
@@ -128,31 +83,33 @@ function registerStaticTools(server: McpServer): void {
     'List all registered agents with their capabilities and online/offline status',
     {},
     async () => {
-      const agents = getAllAgents();
+      const agents = getAgentList();
       const list = agents.map(a => {
-        const caps: string[] = JSON.parse(a.capabilities || '[]');
-        const online = isNodeOnline(a.node_id);
-        return `${online ? '🟢' : '🔴'} ${a.name} — ${a.description || 'no description'} [${caps.join(', ') || 'no capabilities'}]`;
+        const caps = a.capabilities.length > 0 ? a.capabilities.join(', ') : 'no capabilities';
+        return `${a.online ? '🟢' : '🔴'} ${a.name} — ${a.description || 'no description'} [${caps}]`;
       });
-      return {
-        content: [{ type: 'text' as const, text: list.length > 0 ? list.join('\n') : 'No agents registered.' }],
-      };
+      return { content: [{ type: 'text' as const, text: list.length > 0 ? list.join('\n') : 'No agents registered.' }] };
     }
   );
 
   server.tool(
     'anyagent_route',
-    'Route a task to the best available agent based on intent. Set timeout_ms to wait for the result.',
+    'Route a task to the best available agent. Set timeout_ms to wait for the result.',
     {
       intent: z.string().describe('Natural language description of what you want done'),
       timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
     },
     async ({ intent, timeout_ms }) => {
-      const agent = findAgentByCapability(intent);
-      if (!agent) {
+      const routing = findAgentByCapability(intent);
+      if (routing.type === 'none') {
         return { content: [{ type: 'text' as const, text: 'No online agents available.' }], isError: true };
       }
-      return handleToolCall(agent, intent, timeout_ms, 'matched');
+      // For MCP, if ambiguous pick first match (no interactive selection)
+      const agent = routing.agent ?? routing.agents?.[0];
+      if (!agent) {
+        return { content: [{ type: 'text' as const, text: 'No matching agent found.' }], isError: true };
+      }
+      return handleToolCall(agent.name, intent, timeout_ms, 'matched');
     }
   );
 
@@ -178,27 +135,24 @@ function registerStaticTools(server: McpServer): void {
     {},
     async () => {
       const ctx = getContext();
-      return {
-        content: [{ type: 'text' as const, text: ctx || 'No operator context set.' }],
-      };
+      return { content: [{ type: 'text' as const, text: ctx || 'No operator context set.' }] };
     }
   );
 }
 
 function registerDynamicAgentTools(server: McpServer): void {
-  const agents = getAllAgents();
+  const agents = getAgentList();
   for (const agent of agents) {
-    const caps: string[] = JSON.parse(agent.capabilities || '[]');
-    const description = `${agent.description || agent.name}${caps.length > 0 ? ` [${caps.join(', ')}]` : ''}`;
+    const caps = agent.capabilities.length > 0 ? ` [${agent.capabilities.join(', ')}]` : '';
     server.tool(
       `anyagent_${agent.name}`,
-      description,
+      `${agent.description || agent.name}${caps}`,
       {
         intent: z.string().describe('What you want this agent to do'),
-        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
+        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms waiting for result. Omit for async.'),
       },
       async ({ intent, timeout_ms }) => {
-        return handleToolCall(agent, intent, timeout_ms, 'explicit');
+        return handleToolCall(agent.name, intent, timeout_ms, 'explicit');
       }
     );
   }
@@ -207,11 +161,10 @@ function registerDynamicAgentTools(server: McpServer): void {
 // --- HTTP Server ---
 
 export function createMcpServer(mcpPort: number, mcpToken: string): void {
-  const MAX_BODY_SIZE = 1_048_576; // 1MB
+  const MAX_BODY_SIZE = 1_048_576;
   const expectedToken = Buffer.from(`Bearer ${mcpToken}`);
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    // Timing-safe bearer token comparison
     const authHeader = req.headers.authorization ?? '';
     const authBuf = Buffer.from(authHeader);
     const valid = authBuf.length === expectedToken.length && timingSafeEqual(authBuf, expectedToken);
@@ -221,7 +174,6 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
       return;
     }
 
-    // Read body with size limit
     let body: string | undefined;
     if (req.method === 'POST') {
       body = await new Promise<string>((resolve, reject) => {
@@ -229,11 +181,7 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
         let size = 0;
         req.on('data', (chunk: Buffer) => {
           size += chunk.length;
-          if (size > MAX_BODY_SIZE) {
-            req.destroy();
-            reject(new Error('Body too large'));
-            return;
-          }
+          if (size > MAX_BODY_SIZE) { req.destroy(); reject(new Error('Body too large')); return; }
           data += chunk;
         });
         req.on('end', () => resolve(data));
@@ -246,20 +194,15 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
       }
     }
 
-    // Safe JSON parse
     let parsed: unknown;
     if (body) {
-      try {
-        parsed = JSON.parse(body);
-      } catch {
+      try { parsed = JSON.parse(body); } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
         return;
       }
     }
 
-    // Fresh server+transport per request — avoids SDK's "Already connected" error.
-    // Tool handlers close over module-level functions so state is shared correctly.
     const server = new McpServer(
       { name: 'anyagent-hub', version: '2.0.0' },
       { capabilities: { tools: {} } }

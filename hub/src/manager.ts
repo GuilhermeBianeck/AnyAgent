@@ -182,7 +182,9 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
     }
 
     const agentArgs: string[] = JSON.parse(agent.args_json);
-    const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, next.intent);
+    const isContextAware = agent.context_aware !== 0;
+    const spawnIntent = isContextAware ? buildSpawnContext(next.chat_id, next.intent) : next.intent;
+    const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, next.task_id, spawnIntent);
     if (!ok) {
       updateTaskStatus(next.task_id, 'failed', { error: 'Failed to spawn from queue' });
       continue;

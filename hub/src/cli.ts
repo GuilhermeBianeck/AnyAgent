@@ -135,8 +135,14 @@ ${BOLD}Usage${RESET}
   agents              List agents with capabilities
   call <name>         Start a specific agent
   route <intent>      Route by capability matching
+  switch              Switch to a different agent
   stop                Stop the active session
   tasks               Show recent task history
+  retry <task_id>     Retry a failed task
+  cancel <task_id>    Cancel a queued task
+  y / yes             Approve pending task
+  n / no              Deny pending task
+  trust               Trust agent + approve
 
 ${BOLD}Config${RESET}
   default [name|off]  Set/clear default agent
@@ -193,7 +199,7 @@ ${BOLD}Config${RESET}
         const existing = getActiveSessionByChatId(CLI_CHAT_ID);
         if (existing) clearActiveSession(existing.nodeId);
         const taskId = createTaskId();
-        insertTask(taskId, 'telegram', `call:${argStr}`, CLI_CHAT_ID);
+        insertTask(taskId, 'cli', `call:${argStr}`, CLI_CHAT_ID);
         const result = startAgentForTask(agent, taskId, `call:${argStr}`, CLI_CHAT_ID, 'explicit');
         renderStartResult(result);
         break;
@@ -202,7 +208,7 @@ ${BOLD}Config${RESET}
       case 'route': {
         if (!argStr) { console.log('Usage: route <intent>'); break; }
         const taskId = createTaskId();
-        insertTask(taskId, 'telegram', argStr, CLI_CHAT_ID);
+        insertTask(taskId, 'cli', argStr, CLI_CHAT_ID);
         const routing = findAgentByCapability(argStr);
         if (routing.type === 'none') {
           updateTaskStatus(taskId, 'failed', { error: 'No agents online' });
@@ -348,6 +354,96 @@ ${BOLD}Config${RESET}
         break;
       }
 
+      case 'switch': {
+        const onlineAgents = getAgentList().filter(a => a.online);
+        if (onlineAgents.length === 0) { console.log('No online agents.'); break; }
+        console.log('Online agents:');
+        onlineAgents.forEach((a, i) => console.log(`  ${i + 1}. ${a.name} — ${a.description}`));
+        rl.question('Switch to (number): ', (answer) => {
+          const idx = parseInt(answer) - 1;
+          const picked = onlineAgents[idx];
+          if (!picked) { console.log('Invalid choice.'); rl.prompt(); return; }
+          const existing = getActiveSessionByChatId(CLI_CHAT_ID);
+          if (existing) clearActiveSession(existing.nodeId);
+          const agent = getAgentByName(picked.name);
+          if (!agent) { console.log('Agent not found.'); rl.prompt(); return; }
+          const taskId = createTaskId();
+          insertTask(taskId, 'cli', `switch:${picked.name}`, CLI_CHAT_ID);
+          const result = startAgentForTask(agent, taskId, `switch:${picked.name}`, CLI_CHAT_ID, 'user_selected');
+          renderStartResult(result);
+          rl.prompt();
+        });
+        return;
+      }
+
+      case 'retry': {
+        if (!argStr) { console.log('Usage: retry <task_id>'); break; }
+        const original = getTask(argStr);
+        if (!original) { console.log(`${RED}Task not found.${RESET}`); break; }
+        if (!original.agent_name) { console.log(`${RED}No agent on this task.${RESET}`); break; }
+        if (original.retry_count >= 3) { console.log(`${RED}Max retries (3) reached.${RESET}`); break; }
+        const retryAgent = getAgentByName(original.agent_name);
+        if (!retryAgent) { console.log(`${RED}Agent no longer exists.${RESET}`); break; }
+        const retryIntent = original.error ? `${original.intent}\n[Previous: ${original.error}]` : original.intent;
+        const retryTaskId = createTaskId();
+        insertTask(retryTaskId, 'cli', retryIntent, CLI_CHAT_ID, original.retry_count + 1);
+        const retryResult = startAgentForTask(retryAgent, retryTaskId, retryIntent, CLI_CHAT_ID, 'explicit');
+        renderStartResult(retryResult);
+        break;
+      }
+
+      case 'cancel': {
+        if (!argStr) { console.log('Usage: cancel <task_id>'); break; }
+        const cancelTask = getTask(argStr);
+        if (!cancelTask || cancelTask.status !== 'queued') { console.log(`${RED}Task not found or not queued.${RESET}`); break; }
+        updateTaskStatus(argStr, 'failed', { error: 'Cancelled by user' });
+        console.log(`${GREEN}✓${RESET} Task cancelled.`);
+        break;
+      }
+
+      case 'yes':
+      case 'y': {
+        // Approve the most recent pending_approval task
+        const tasks = getRecentTasks(CLI_CHAT_ID, 5);
+        const pending = tasks.find(t => t.status === 'pending_approval');
+        if (!pending) { console.log('No pending approvals.'); break; }
+        const decision = handleApprovalDecision(pending.task_id, 'approve');
+        if (decision.ok && decision.task && decision.agentName) {
+          const agent = getAgentByName(decision.agentName);
+          if (agent) {
+            const r = startAgentForTask(agent, pending.task_id, decision.task.intent, CLI_CHAT_ID, 'explicit');
+            renderStartResult(r);
+          }
+        }
+        break;
+      }
+
+      case 'no':
+      case 'n': {
+        const tasks2 = getRecentTasks(CLI_CHAT_ID, 5);
+        const pending2 = tasks2.find(t => t.status === 'pending_approval');
+        if (!pending2) { console.log('No pending approvals.'); break; }
+        handleApprovalDecision(pending2.task_id, 'deny');
+        console.log(`${RED}✗${RESET} Task denied.`);
+        break;
+      }
+
+      case 'trust': {
+        const tasks3 = getRecentTasks(CLI_CHAT_ID, 5);
+        const pending3 = tasks3.find(t => t.status === 'pending_approval');
+        if (!pending3) { console.log('No pending approvals.'); break; }
+        const decision3 = handleApprovalDecision(pending3.task_id, 'trust');
+        if (decision3.ok && decision3.task && decision3.agentName) {
+          console.log(`${GREEN}✓${RESET} Agent ${decision3.agentName} trusted.`);
+          const agent3 = getAgentByName(decision3.agentName);
+          if (agent3) {
+            const r3 = startAgentForTask(agent3, pending3.task_id, decision3.task.intent, CLI_CHAT_ID, 'explicit');
+            renderStartResult(r3);
+          }
+        }
+        break;
+      }
+
       case 'quit':
       case 'exit': {
         console.log('Bye.');
@@ -370,7 +466,7 @@ ${BOLD}Config${RESET}
             const agent = getAgentByName(defaultName);
             if (agent) {
               const taskId = createTaskId();
-              insertTask(taskId, 'telegram', trimmed, CLI_CHAT_ID);
+              insertTask(taskId, 'cli', trimmed, CLI_CHAT_ID);
               const result = startAgentForTask(agent, taskId, trimmed, CLI_CHAT_ID, 'default');
               renderStartResult(result);
               break;

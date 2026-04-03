@@ -60,11 +60,12 @@ type PairingRequestCallback = (connId: string, workerName: string, workerDesc: s
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
 const pendingPairs = new Map<string, PendingPair>();
-let ttyOutputCallback: TtyCallback | null = null;
-let structuredOutputCallback: StructuredOutputCallback | null = null;
-let sessionEndCallback: SessionEndCallback | null = null;
-let agentChangeCallback: AgentChangeCallback | null = null;
-let pairingRequestCallback: PairingRequestCallback | null = null;
+// Multi-listener arrays — both bot.ts and cli.ts can register handlers
+const ttyOutputCallbacks: TtyCallback[] = [];
+const structuredOutputCallbacks: StructuredOutputCallback[] = [];
+const sessionEndCallbacks: SessionEndCallback[] = [];
+const agentChangeCallbacks: AgentChangeCallback[] = [];
+const pairingRequestCallbacks: PairingRequestCallback[] = [];
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -159,23 +160,23 @@ export function clearDefaultAgent(chatId: number): void {
 }
 
 export function onTtyOutput(callback: TtyCallback): void {
-  ttyOutputCallback = callback;
+  ttyOutputCallbacks.push(callback);
 }
 
 export function onStructuredOutput(callback: StructuredOutputCallback): void {
-  structuredOutputCallback = callback;
+  structuredOutputCallbacks.push(callback);
 }
 
 export function onSessionEnd(callback: SessionEndCallback): void {
-  sessionEndCallback = callback;
+  sessionEndCallbacks.push(callback);
 }
 
 export function onAgentChange(callback: AgentChangeCallback): void {
-  agentChangeCallback = callback;
+  agentChangeCallbacks.push(callback);
 }
 
 export function onPairingRequest(callback: PairingRequestCallback): void {
-  pairingRequestCallback = callback;
+  pairingRequestCallbacks.push(callback);
 }
 
 export function createGateway(
@@ -214,9 +215,9 @@ export function createGateway(
     ws.on('message', async (data, isBinary) => {
       if (isBinary) {
         // Binary frames = TTY data; only accept from authenticated workers
-        if (session.authenticated && session.nodeId && ttyOutputCallback) {
+        if (session.authenticated && session.nodeId && ttyOutputCallbacks.length > 0) {
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-          ttyOutputCallback(session.nodeId, buf);
+          for (const cb of ttyOutputCallbacks) cb(session.nodeId, buf);
           touchSession(session.nodeId);
         }
         return;
@@ -239,7 +240,7 @@ export function createGateway(
 
         // Remove from node map immediately so isNodeOnline returns false
         nodeMap.delete(disconnectedNodeId);
-        if (agentChangeCallback) agentChangeCallback();
+        for (const cb of agentChangeCallbacks) cb();
 
         if (active) {
           // Grace period: wait 60 seconds for reconnection before marking failed
@@ -256,7 +257,7 @@ export function createGateway(
               const label = stillActive.agentName ? `Agent <code>${escapeHtml(stillActive.agentName)}</code>` : 'Session';
               bot?.api.sendMessage(stillActive.chatId, `❌ ${label} — worker did not reconnect.`, { parse_mode: 'HTML' }).catch(() => {});
               clearActiveSession(disconnectedNodeId);
-              if (sessionEndCallback) sessionEndCallback(disconnectedNodeId, 1);
+              for (const cb of sessionEndCallbacks) cb(disconnectedNodeId, 1);
             }
           }, 60_000);
         }
@@ -331,10 +332,9 @@ async function handleMessage(
       });
       deletePairCode(params.code);
       // Notify management interface(s) about the pairing request
-      if (pairingRequestCallback) {
-        pairingRequestCallback(connId, params.name ?? '', params.description ?? '');
+      if (pairingRequestCallbacks.length > 0) {
+        for (const cb of pairingRequestCallbacks) cb(connId, params.name ?? '', params.description ?? '');
       } else {
-        // No management interface registered — auto-reject
         console.warn('[gateway] Pairing request received but no management interface registered');
         sendJson(session.ws, makeError(req.id, -32002, 'No management interface available'));
         pendingPairs.delete(connId);
@@ -453,7 +453,7 @@ async function handleMessage(
         }
         clearActiveSession(session.nodeId);
         // Notify bot to process queued tasks
-        if (sessionEndCallback) sessionEndCallback(session.nodeId, params.code);
+        for (const cb of sessionEndCallbacks) cb(session.nodeId, params.code);
       }
       break;
     }
@@ -481,13 +481,13 @@ async function handleMessage(
         updateTaskStatus(params.taskId, 'failed', { error: payload.message ?? 'Unknown error' });
       }
       // Forward to callback (bot.ts will render to Telegram)
-      if (structuredOutputCallback) {
-        structuredOutputCallback(session.nodeId, params);
+      for (const cb of structuredOutputCallbacks) {
+        cb(session.nodeId, params);
       }
       // Clear session and process queue on terminal output types
       if (params.type === 'result' || params.type === 'error') {
         clearActiveSession(session.nodeId);
-        if (sessionEndCallback) sessionEndCallback(session.nodeId, params.type === 'result' ? 0 : 1);
+        for (const cb of sessionEndCallbacks) cb(session.nodeId, params.type === 'result' ? 0 : 1);
       }
       break;
     }
@@ -513,7 +513,7 @@ async function handleMessage(
       const pv = params.protocolVersion ?? 1;
       console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s), protocol v${pv}`);
       sendJson(session.ws, makeResult(req.id, { success: true }));
-      if (agentChangeCallback) agentChangeCallback();
+      for (const cb of agentChangeCallbacks) cb();
       break;
     }
 
