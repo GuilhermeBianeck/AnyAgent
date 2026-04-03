@@ -107,7 +107,7 @@ export interface AgentRow {
 }
 
 // Task row (v2)
-export type TaskStatus = 'submitted' | 'queued' | 'routed' | 'running' | 'complete' | 'failed' | 'timeout';
+export type TaskStatus = 'submitted' | 'pending_approval' | 'queued' | 'routed' | 'running' | 'complete' | 'failed' | 'timeout';
 export type TaskSource = 'telegram' | 'mcp';
 export type RoutingMethod = 'default' | 'single' | 'matched' | 'explicit' | 'user_selected';
 

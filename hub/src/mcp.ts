@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { getAllAgents, insertTask, updateTaskStatus, getTask, getQueuedTasksByNodeId } from './db.js';
 import { isNodeOnline, sendSpawn, onAgentChange, getActiveSession, setActiveSession } from './gateway.js';
+import { getContext } from './context.js';
 import type { AgentRow, TaskRow } from './types.js';
 
 type McpTaskCallback = (task: TaskRow) => void;
@@ -226,6 +227,18 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
       if (task.result_summary) text += `\nResult: ${task.result_summary}`;
       if (task.error) text += `\nError: ${task.error}`;
       return { content: [{ type: 'text' as const, text }] };
+    }
+  );
+
+  server.tool(
+    'anyagent_context',
+    'Read the operator\'s persistent context (environment info, preferences, notes)',
+    {},
+    async () => {
+      const ctx = getContext();
+      return {
+        content: [{ type: 'text' as const, text: ctx || 'No operator context set.' }],
+      };
     }
   );
 

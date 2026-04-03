@@ -43,6 +43,7 @@ try { db.exec(`ALTER TABLE nodes ADD COLUMN description TEXT NOT NULL DEFAULT ''
 try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN context_aware INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 // Fix agent name collision: namespace by (name, node_id) instead of name alone
 try { db.exec(`DROP INDEX IF EXISTS sqlite_autoindex_agents_1`); } catch { /* may not exist */ }
@@ -62,6 +63,11 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS default_agents (
     chat_id INTEGER PRIMARY KEY,
     agent_name TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS approval_config (
+    chat_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'off'
   );
 
   CREATE TABLE IF NOT EXISTS tasks (
@@ -235,6 +241,10 @@ export function getLastCompletedTask(chatId: number): TaskRow | undefined {
   return db.prepare(`SELECT * FROM tasks WHERE chat_id = ? AND status = 'complete' ORDER BY updated_at DESC LIMIT 1`).get(chatId) as TaskRow | undefined;
 }
 
+export function getRecentCompletedTasksByChatId(chatId: number, limit: number = 5): TaskRow[] {
+  return db.prepare(`SELECT * FROM tasks WHERE chat_id = ? AND status = 'complete' ORDER BY updated_at DESC LIMIT ?`).all(chatId, limit) as TaskRow[];
+}
+
 export function getQueuedTasksByNodeId(nodeId: string): TaskRow[] {
   return db.prepare(`SELECT * FROM tasks WHERE node_id = ? AND status = 'queued' ORDER BY created_at ASC`).all(nodeId) as TaskRow[];
 }
@@ -247,7 +257,7 @@ export function cleanOldTasks(daysToKeep: number = 30): void {
 export function failStaleTasks(): number {
   const result = db.prepare(
     `UPDATE tasks SET status = 'failed', error = 'Hub restarted', updated_at = datetime('now')
-     WHERE status IN ('running', 'queued', 'routed')`
+     WHERE status IN ('running', 'queued', 'routed', 'pending_approval')`
   ).run();
   return result.changes;
 }
@@ -279,4 +289,26 @@ export function purgeTasksByChatId(chatId: number): number {
 export function purgeAllTasks(): number {
   const result = db.prepare(`DELETE FROM tasks`).run();
   return result.changes;
+}
+
+// Approval config
+export type ApprovalMode = 'off' | 'mcp' | 'always';
+
+export function getApprovalMode(chatId: number): ApprovalMode {
+  const row = db.prepare(`SELECT mode FROM approval_config WHERE chat_id = ?`).get(chatId) as { mode: string } | undefined;
+  return (row?.mode as ApprovalMode) ?? 'off';
+}
+
+export function setApprovalMode(chatId: number, mode: ApprovalMode): void {
+  db.prepare(`INSERT OR REPLACE INTO approval_config (chat_id, mode) VALUES (?, ?)`).run(chatId, mode);
+}
+
+// Agent trust (per-agent, skips approval when trusted)
+export function isAgentTrusted(agentName: string): boolean {
+  const row = db.prepare(`SELECT trusted FROM agents WHERE name = ?`).get(agentName) as { trusted: number } | undefined;
+  return row?.trusted === 1;
+}
+
+export function setAgentTrusted(agentName: string, trusted: boolean): void {
+  db.prepare(`UPDATE agents SET trusted = ? WHERE name = ?`).run(trusted ? 1 : 0, agentName);
 }

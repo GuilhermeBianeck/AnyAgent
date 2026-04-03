@@ -3,8 +3,9 @@ import { randomBytes } from 'crypto';
 import {
   insertPairCode, getAllNodes, getAgentByName, getAllAgents,
   insertTask, updateTaskStatus, getRecentTasksByChatId, getTask,
-  getLastCompletedTask, getQueuedTasksByNodeId, getRunningTasksByNodeId,
+  getQueuedTasksByNodeId, getRunningTasksByNodeId,
   purgeTasksByChatId, revokeNode,
+  getApprovalMode, setApprovalMode, isAgentTrusted, setAgentTrusted,
 } from './db.js';
 import {
   isNodeOnline,
@@ -25,6 +26,7 @@ import {
 } from './gateway.js';
 import { escapeHtml } from './format.js';
 import { stripAnsi } from './output.js';
+import { getContext, setContext, appendContext, clearContext, buildSpawnContext } from './context.js';
 import type { AgentRow, OutputParams, TaskStatus } from './types.js';
 
 const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH ?? '3', 10);
@@ -112,13 +114,44 @@ async function startAgentForTask(
   agent: AgentRow,
   taskId: string,
   intent: string,
-  routingMethod: 'default' | 'single' | 'matched' | 'explicit' | 'user_selected',
-  context?: string
+  routingMethod: 'default' | 'single' | 'matched' | 'explicit' | 'user_selected'
 ): Promise<boolean> {
   if (!isNodeOnline(agent.node_id)) {
     updateTaskStatus(taskId, 'failed', { error: 'Worker offline', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
     await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(agent.name)}</code> — worker is offline.`);
     return false;
+  }
+
+  // Approval gate — check if this task needs human approval before spawning
+  // Skip if task was already approved (status reset to 'submitted' by approval callback)
+  const currentTask = getTask(taskId);
+  const wasAlreadyApproved = currentTask?.status === 'submitted' && currentTask?.routing_method !== null;
+  const approvalMode = getApprovalMode(chatId);
+  const needsApproval =
+    !wasAlreadyApproved &&
+    ((approvalMode === 'always') ||
+     (approvalMode === 'mcp' && routingMethod !== 'explicit' && routingMethod !== 'default'));
+  if (needsApproval && !isAgentTrusted(agent.name)) {
+    updateTaskStatus(taskId, 'pending_approval', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
+    const intentPreview = intent.length > 80 ? intent.slice(0, 80) + '...' : intent;
+    await sendHtmlDirect(bot, chatId,
+      `📋 <b>Task approval required</b>\n<i>${escapeHtml(intentPreview)}</i>\n→ <code>${escapeHtml(agent.name)}</code>`, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Approve', callback_data: `taskapprove:${taskId}` }],
+            [{ text: '🔓 Always Allow Agent', callback_data: `tasttrust:${taskId}` }],
+            [{ text: '❌ Deny', callback_data: `taskdeny:${taskId}` }],
+          ],
+        },
+      });
+    // Auto-deny after 5 minutes
+    setTimeout(() => {
+      const t = getTask(taskId);
+      if (t && t.status === 'pending_approval') {
+        updateTaskStatus(taskId, 'failed', { error: 'Approval timed out' });
+      }
+    }, 5 * 60 * 1000);
+    return true; // Task created, waiting for approval
   }
 
   // Check queue (P0-6)
@@ -139,9 +172,9 @@ async function startAgentForTask(
   }
 
   const agentArgs: string[] = JSON.parse(agent.args_json);
-  // Fix 6: skip context injection for agents with context_aware=false
+  // Build full context for context-aware agents
   const isContextAware = agent.context_aware !== 0;
-  const spawnContext = (context && isContextAware) ? `[Context from previous task: ${context}]\n${intent}` : intent;
+  const spawnContext = isContextAware ? buildSpawnContext(chatId, intent) : intent;
   const ok = sendSpawn(agent.node_id, agent.binary, agentArgs, taskId, spawnContext);
   if (!ok) {
     updateTaskStatus(taskId, 'failed', { error: 'Failed to spawn', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
@@ -412,6 +445,9 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       '<b>Config</b>\n' +
       '/default — Set an auto-start agent\n' +
       '/status — Show and pin live status\n' +
+      '/context — Manage persistent operator context\n' +
+      '/approve — Set task approval mode\n' +
+      '/revoke — Revoke a paired worker\n' +
       '/purge — Delete all task history'
     );
 
@@ -680,6 +716,123 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     }
   });
 
+  // --- /approve ---
+  bot.command('approve', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const mode = typeof ctx.match === 'string' ? ctx.match.trim().toLowerCase() : '';
+    if (mode === 'off' || mode === 'mcp' || mode === 'always') {
+      setApprovalMode(ctx.chat!.id, mode);
+      const desc = mode === 'off' ? 'disabled' : mode === 'mcp' ? 'required for MCP tasks' : 'required for all tasks';
+      await ctx.reply(`✅ Approval ${desc}.`);
+    } else {
+      const current = getApprovalMode(ctx.chat!.id);
+      await sendHtml(ctx,
+        `<b>Task approval mode:</b> <code>${escapeHtml(current)}</code>\n\n` +
+        '/approve off — all tasks auto-run\n' +
+        '/approve mcp — MCP tasks need approval\n' +
+        '/approve always — all tasks need approval'
+      );
+    }
+  });
+
+  // --- Callback: task approval ---
+  bot.callbackQuery(/^taskapprove:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const task = getTask(taskId);
+    if (!task || task.status !== 'pending_approval') {
+      await ctx.answerCallbackQuery({ text: 'Task not found or already handled.' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: 'Approved!' });
+    await ctx.editMessageText(`✅ Approved: <i>${escapeHtml(task.intent.slice(0, 60))}</i>`, { parse_mode: 'HTML' });
+    // Now actually spawn the agent
+    const agent = task.agent_name ? getAgentByName(task.agent_name) : undefined;
+    if (!agent) {
+      updateTaskStatus(taskId, 'failed', { error: 'Agent no longer exists' });
+      return;
+    }
+    updateTaskStatus(taskId, 'submitted'); // reset to submitted so startAgentForTask can proceed
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'explicit');
+    updatePinnedStatus();
+  });
+
+  bot.callbackQuery(/^tasttrust:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const task = getTask(taskId);
+    if (!task || task.status !== 'pending_approval') {
+      await ctx.answerCallbackQuery({ text: 'Task not found or already handled.' });
+      return;
+    }
+    // Trust the agent for future tasks
+    if (task.agent_name) setAgentTrusted(task.agent_name, true);
+    await ctx.answerCallbackQuery({ text: `Agent ${task.agent_name} trusted!` });
+    await ctx.editMessageText(`🔓 Trusted <code>${escapeHtml(task.agent_name ?? '')}</code>. Approved: <i>${escapeHtml(task.intent.slice(0, 60))}</i>`, { parse_mode: 'HTML' });
+    // Spawn
+    const agent = task.agent_name ? getAgentByName(task.agent_name) : undefined;
+    if (!agent) {
+      updateTaskStatus(taskId, 'failed', { error: 'Agent no longer exists' });
+      return;
+    }
+    updateTaskStatus(taskId, 'submitted');
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'explicit');
+    updatePinnedStatus();
+  });
+
+  bot.callbackQuery(/^taskdeny:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const task = getTask(taskId);
+    if (!task || task.status !== 'pending_approval') {
+      await ctx.answerCallbackQuery({ text: 'Task not found or already handled.' });
+      return;
+    }
+    updateTaskStatus(taskId, 'failed', { error: 'Denied by operator' });
+    await ctx.editMessageText(`❌ Denied: <i>${escapeHtml(task.intent.slice(0, 60))}</i>`, { parse_mode: 'HTML' });
+    await ctx.answerCallbackQuery({ text: 'Denied.' });
+  });
+
+  // --- /context ---
+  bot.command('context', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+    if (!arg) {
+      const current = getContext();
+      if (!current) {
+        await ctx.reply('No context set. Use /context set <text> to add operator context.');
+      } else {
+        await sendHtml(ctx, `<b>Operator context:</b>\n<pre>${escapeHtml(current)}</pre>`);
+      }
+      return;
+    }
+
+    if (arg.startsWith('set ')) {
+      const text = arg.slice(4).trim();
+      if (!text) { await ctx.reply('Usage: /context set <text>'); return; }
+      setContext(text);
+      await ctx.reply('✅ Context updated.');
+      return;
+    }
+
+    if (arg.startsWith('add ')) {
+      const line = arg.slice(4).trim();
+      if (!line) { await ctx.reply('Usage: /context add <line>'); return; }
+      appendContext(line);
+      await ctx.reply('✅ Line appended to context.');
+      return;
+    }
+
+    if (arg === 'clear') {
+      clearContext();
+      await ctx.reply('✅ Context cleared.');
+      return;
+    }
+
+    await ctx.reply('Usage: /context [set <text> | add <line> | clear]');
+  });
+
   // --- Callback: approve/reject pair ---
   bot.callbackQuery(/^approve:(.+)$/, async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
@@ -809,9 +962,12 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     await ctx.answerCallbackQuery({ text: 'Retrying...' });
 
     const taskId = createTaskId();
-    const retryContext = original.error ? `Previous attempt failed: ${original.error}` : undefined;
-    insertTask(taskId, original.source, original.intent, original.chat_id ?? undefined, original.retry_count + 1);
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, original.intent, 'explicit', retryContext);
+    // Retry intent includes the error so the agent knows what failed
+    const retryIntent = original.error
+      ? `${original.intent}\n[Previous attempt failed: ${original.error}]`
+      : original.intent;
+    insertTask(taskId, original.source, retryIntent, original.chat_id ?? undefined, original.retry_count + 1);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, retryIntent, 'explicit');
     updatePinnedStatus();
   });
 
@@ -844,11 +1000,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     await ctx.answerCallbackQuery({ text: `Routing to ${agentName}...` });
     await ctx.editMessageText(`Routing to <code>${escapeHtml(agentName)}</code>...`, { parse_mode: 'HTML' });
 
-    // Context carry (P0-9)
-    const lastCompleted = getLastCompletedTask(ctx.chat!.id);
-    const context = lastCompleted?.result_summary?.slice(0, 500);
-
-    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'user_selected', context);
+    await startAgentForTask(bot, ctx.chat!.id, agent, taskId, task.intent, 'user_selected');
     updatePinnedStatus();
   });
 
@@ -873,10 +1025,6 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     const taskId = createTaskId();
     insertTask(taskId, 'telegram', text, chatId);
 
-    // Context carry (P0-9): get last completed task result
-    const lastCompleted = getLastCompletedTask(chatId);
-    const context = lastCompleted?.result_summary?.slice(0, 500);
-
     // Check default agent first
     const defaultName = getDefaultAgent(chatId);
     if (defaultName) {
@@ -887,7 +1035,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
         updateTaskStatus(taskId, 'failed', { error: 'Default agent not found' });
         return;
       }
-      await startAgentForTask(bot, chatId, agent, taskId, text, 'default', context);
+      await startAgentForTask(bot, chatId, agent, taskId, text, 'default');
       updatePinnedStatus();
       return;
     }
@@ -902,7 +1050,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
 
     if ('agent' in result) {
       // Clear match — route directly
-      await startAgentForTask(bot, chatId, result.agent, taskId, text, result.method, context);
+      await startAgentForTask(bot, chatId, result.agent, taskId, text, result.method);
       updatePinnedStatus();
       return;
     }
