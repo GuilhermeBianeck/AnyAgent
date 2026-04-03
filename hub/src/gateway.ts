@@ -55,6 +55,7 @@ type TtyCallback = (nodeId: string, data: Buffer) => void;
 type StructuredOutputCallback = (nodeId: string, params: OutputParams) => void;
 type SessionEndCallback = (nodeId: string, exitCode: number) => void;
 type AgentChangeCallback = () => void;
+type PairingRequestCallback = (connId: string, workerName: string, workerDesc: string) => void;
 
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
@@ -63,6 +64,7 @@ let ttyOutputCallback: TtyCallback | null = null;
 let structuredOutputCallback: StructuredOutputCallback | null = null;
 let sessionEndCallback: SessionEndCallback | null = null;
 let agentChangeCallback: AgentChangeCallback | null = null;
+let pairingRequestCallback: PairingRequestCallback | null = null;
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -172,9 +174,13 @@ export function onAgentChange(callback: AgentChangeCallback): void {
   agentChangeCallback = callback;
 }
 
+export function onPairingRequest(callback: PairingRequestCallback): void {
+  pairingRequestCallback = callback;
+}
+
 export function createGateway(
   port: number,
-  bot: Bot,
+  bot: Bot | null,
   allowedUserId: number,
   wsSecret?: string
 ): WebSocketServer {
@@ -237,18 +243,18 @@ export function createGateway(
 
         if (active) {
           // Grace period: wait 60 seconds for reconnection before marking failed
-          bot.api.sendMessage(active.chatId, `⚠️ Worker disconnected. Waiting 60s for reconnect...`, { parse_mode: 'HTML' }).catch(() => {});
+          bot?.api.sendMessage(active.chatId, `⚠️ Worker disconnected. Waiting 60s for reconnect...`, { parse_mode: 'HTML' }).catch(() => {});
           setTimeout(() => {
             // Check if the node reconnected (new session in nodeMap)
             if (isNodeOnline(disconnectedNodeId)) {
-              bot.api.sendMessage(active.chatId, `✅ Worker reconnected.`, { parse_mode: 'HTML' }).catch(() => {});
+              bot?.api.sendMessage(active.chatId, `✅ Worker reconnected.`, { parse_mode: 'HTML' }).catch(() => {});
               return; // Reconnected — don't fail the task
             }
             // Still offline — clear session and fail tasks
             const stillActive = getActiveSession(disconnectedNodeId);
             if (stillActive) {
               const label = stillActive.agentName ? `Agent <code>${escapeHtml(stillActive.agentName)}</code>` : 'Session';
-              bot.api.sendMessage(stillActive.chatId, `❌ ${label} — worker did not reconnect.`, { parse_mode: 'HTML' }).catch(() => {});
+              bot?.api.sendMessage(stillActive.chatId, `❌ ${label} — worker did not reconnect.`, { parse_mode: 'HTML' }).catch(() => {});
               clearActiveSession(disconnectedNodeId);
               if (sessionEndCallback) sessionEndCallback(disconnectedNodeId, 1);
             }
@@ -283,7 +289,7 @@ export function createGateway(
         }
         // Notify user
         const label = row.agent_name ? `Agent <code>${escapeHtml(row.agent_name)}</code>` : 'Session';
-        bot.api.sendMessage(row.chat_id, `${label} timed out after inactivity.`, { parse_mode: 'HTML' }).catch(() => {});
+        bot?.api.sendMessage(row.chat_id, `${label} timed out after inactivity.`, { parse_mode: 'HTML' }).catch(() => {});
         clearActiveSession(row.node_id);
         console.log(`[gateway] Session on ${row.node_id} timed out`);
       }
@@ -298,7 +304,7 @@ async function handleMessage(
   connId: string,
   session: WorkerSession,
   req: JsonRpcRequest,
-  bot: Bot,
+  bot: Bot | null,
   allowedUserId: number
 ): Promise<void> {
   deleteExpiredPairCodes();
@@ -324,26 +330,13 @@ async function handleMessage(
         description: params.description,
       });
       deletePairCode(params.code);
-      const workerLabel = params.name
-        ? `<b>${escapeHtml(params.name)}</b>${params.description ? ` — ${escapeHtml(params.description)}` : ''}`
-        : `Public Key: <code>${escapeHtml(params.publicKey.slice(0, 16))}...</code>`;
-      try {
-        await bot.api.sendMessage(
-          allowedUserId,
-          `🔗 New worker wants to pair.\n${workerLabel}\nApprove?`,
-          {
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: [[
-                { text: '✅ Approve', callback_data: `approve:${connId}` },
-                { text: '❌ Reject', callback_data: `reject:${connId}` },
-              ]],
-            },
-          }
-        );
-      } catch (err) {
-        console.error('[gateway] Failed to send Telegram approval:', err);
-        sendJson(session.ws, makeError(req.id, -32002, 'Failed to send approval request'));
+      // Notify management interface(s) about the pairing request
+      if (pairingRequestCallback) {
+        pairingRequestCallback(connId, params.name ?? '', params.description ?? '');
+      } else {
+        // No management interface registered — auto-reject
+        console.warn('[gateway] Pairing request received but no management interface registered');
+        sendJson(session.ws, makeError(req.id, -32002, 'No management interface available'));
         pendingPairs.delete(connId);
       }
       break;
@@ -431,7 +424,7 @@ async function handleMessage(
         if (active) {
           const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Process';
           const reason = params.error ? `: ${escapeHtml(params.error)}` : '';
-          bot.api.sendMessage(active.chatId, `❌ ${label} failed to start${reason}`, { parse_mode: 'HTML' }).catch(() => {});
+          bot?.api.sendMessage(active.chatId, `❌ ${label} failed to start${reason}`, { parse_mode: 'HTML' }).catch(() => {});
           clearActiveSession(session.nodeId);
         }
       }
@@ -447,7 +440,7 @@ async function handleMessage(
         if (active) {
           const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Session';
           const codeStr = params.code === 0 ? 'normally' : `with code ${params.code}`;
-          bot.api.sendMessage(active.chatId, `${label} exited ${codeStr}.`, { parse_mode: 'HTML' }).catch(() => {});
+          bot?.api.sendMessage(active.chatId, `${label} exited ${codeStr}.`, { parse_mode: 'HTML' }).catch(() => {});
         }
         // Mark running tasks on this node as complete/failed (legacy TTY agents don't send structured output)
         const runningTasks = getRunningTasksByNodeId(session.nodeId);

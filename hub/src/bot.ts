@@ -23,6 +23,7 @@ import {
   setDefaultAgent,
   getDefaultAgent,
   clearDefaultAgent,
+  onPairingRequest,
 } from './gateway.js';
 import { escapeHtml } from './format.js';
 import { stripAnsi } from './output.js';
@@ -831,6 +832,20 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     }
 
     await ctx.reply('Usage: /context [set <text> | add <line> | clear]');
+  });
+
+  // --- Pairing request handler (from gateway) ---
+  onPairingRequest((connId, workerName, workerDesc) => {
+    const label = workerName ? `<b>${escapeHtml(workerName)}</b>${workerDesc ? ` — ${escapeHtml(workerDesc)}` : ''}` : `Connection ${escapeHtml(connId.slice(0, 8))}`;
+    bot.api.sendMessage(allowedUserId, `🔗 New worker wants to pair.\n${label}\nApprove?`, {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Approve', callback_data: `approve:${connId}` },
+          { text: '❌ Reject', callback_data: `reject:${connId}` },
+        ]],
+      },
+    }).catch((err) => console.error('[bot] Failed to send pairing request:', err));
   });
 
   // --- Callback: approve/reject pair ---
