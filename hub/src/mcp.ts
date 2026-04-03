@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { getAllAgents, insertTask, updateTaskStatus, getTask, getQueuedTasksByNodeId } from './db.js';
-import { isNodeOnline, sendSpawn, onAgentChange, getActiveSession, setActiveSession } from './gateway.js';
+import { isNodeOnline, sendSpawn, getActiveSession, setActiveSession } from './gateway.js';
 import { getContext } from './context.js';
 import type { AgentRow, TaskRow } from './types.js';
 
@@ -78,7 +78,6 @@ function spawnAgentTaskSync(agent: AgentRow, intent: string, routingMethod: 'mat
   return { taskId, status: 'running' };
 }
 
-// Wait for a task to complete, polling every 500ms up to timeoutMs
 async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -88,10 +87,9 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
-  return null; // timed out
+  return null;
 }
 
-// Unified tool handler: spawn + optionally block for result
 async function handleToolCall(agent: AgentRow, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit'): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   if (!isNodeOnline(agent.node_id)) {
     return { content: [{ type: 'text', text: `Agent ${agent.name} is offline.` }], isError: true };
@@ -103,7 +101,6 @@ async function handleToolCall(agent: AgentRow, intent: string, timeoutMs: number
     return { content: [{ type: 'text', text: `Failed to spawn ${agent.name}.` }], isError: true };
   }
 
-  // Blocking mode: wait for result if timeout_ms provided
   if (timeoutMs && timeoutMs > 0 && (status === 'running' || status === 'queued')) {
     const result = await waitForTask(taskId, timeoutMs);
     if (result) {
@@ -114,73 +111,18 @@ async function handleToolCall(agent: AgentRow, intent: string, timeoutMs: number
         return { content: [{ type: 'text', text: `Task failed: ${result.error ?? 'unknown error'}` }], isError: true };
       }
     }
-    // Timed out waiting — fall through to async response
     return { content: [{ type: 'text', text: `Task ${taskId} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
   }
 
-  // Async mode: return task ID for polling
   if (status === 'queued') {
     return { content: [{ type: 'text', text: `Agent ${agent.name} is busy. Task ${taskId} queued. Use anyagent_task_status to check.` }] };
   }
   return { content: [{ type: 'text', text: `Task ${taskId} started on ${agent.name}. Use anyagent_task_status to check.` }] };
 }
 
-// Track dynamically registered per-agent tools so we can remove/re-add them
-interface RegisteredToolHandle {
-  remove: () => void;
-}
-const agentTools = new Map<string, RegisteredToolHandle>();
+// --- Tool registration functions (called per-request on fresh McpServer instances) ---
 
-function registerAgentTool(server: McpServer, agent: AgentRow): void {
-  const toolName = `anyagent_${agent.name}`;
-  const caps: string[] = JSON.parse(agent.capabilities || '[]');
-  const description = `${agent.description || agent.name}${caps.length > 0 ? ` [${caps.join(', ')}]` : ''}`;
-
-  const handle = server.tool(
-    toolName,
-    description,
-    {
-      intent: z.string().describe('What you want this agent to do'),
-      timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
-    },
-    async ({ intent, timeout_ms }) => {
-      return handleToolCall(agent, intent, timeout_ms, 'explicit');
-    }
-  );
-  agentTools.set(toolName, handle);
-}
-
-function syncAgentTools(server: McpServer): void {
-  const agents = getAllAgents();
-  const currentToolNames = new Set(agents.map(a => `anyagent_${a.name}`));
-
-  // Remove stale tools (agents that no longer exist)
-  for (const [name, handle] of agentTools) {
-    if (!currentToolNames.has(name)) {
-      handle.remove();
-      agentTools.delete(name);
-    }
-  }
-
-  // Add new tools (agents that don't have a tool yet)
-  for (const agent of agents) {
-    const toolName = `anyagent_${agent.name}`;
-    if (!agentTools.has(toolName)) {
-      registerAgentTool(server, agent);
-    }
-  }
-
-  console.log(`[mcp] Synced ${agentTools.size} agent tool(s)`);
-}
-
-export function createMcpServer(mcpPort: number, mcpToken: string): void {
-  const server = new McpServer(
-    { name: 'anyagent-hub', version: '2.0.0' },
-    { capabilities: { tools: {} } }
-  );
-
-  // Static tools (always available)
-
+function registerStaticTools(server: McpServer): void {
   server.tool(
     'anyagent_list_agents',
     'List all registered agents with their capabilities and online/offline status',
@@ -241,12 +183,30 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
       };
     }
   );
+}
 
-  // Dynamic per-agent tools — sync on startup and on agent changes
-  syncAgentTools(server);
-  onAgentChange(() => syncAgentTools(server));
+function registerDynamicAgentTools(server: McpServer): void {
+  const agents = getAllAgents();
+  for (const agent of agents) {
+    const caps: string[] = JSON.parse(agent.capabilities || '[]');
+    const description = `${agent.description || agent.name}${caps.length > 0 ? ` [${caps.join(', ')}]` : ''}`;
+    server.tool(
+      `anyagent_${agent.name}`,
+      description,
+      {
+        intent: z.string().describe('What you want this agent to do'),
+        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
+      },
+      async ({ intent, timeout_ms }) => {
+        return handleToolCall(agent, intent, timeout_ms, 'explicit');
+      }
+    );
+  }
+}
 
-  // HTTP server with timing-safe bearer token auth
+// --- HTTP Server ---
+
+export function createMcpServer(mcpPort: number, mcpToken: string): void {
   const MAX_BODY_SIZE = 1_048_576; // 1MB
   const expectedToken = Buffer.from(`Bearer ${mcpToken}`);
 
@@ -297,6 +257,15 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
         return;
       }
     }
+
+    // Fresh server+transport per request — avoids SDK's "Already connected" error.
+    // Tool handlers close over module-level functions so state is shared correctly.
+    const server = new McpServer(
+      { name: 'anyagent-hub', version: '2.0.0' },
+      { capabilities: { tools: {} } }
+    );
+    registerStaticTools(server);
+    registerDynamicAgentTools(server);
 
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
