@@ -1,75 +1,76 @@
-# AnyAgent
+<h1 align="center">AnyAgent</h1>
 
-Make any agent on any machine available as an MCP tool. Self-hosted, privacy-first, managed from your terminal or Telegram.
+<p align="center">
+  <strong>The simplest way to make your agents work together as MCP tools.</strong>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#mcp-tools">MCP Tools</a> &middot;
+  <a href="#management">Management</a> &middot;
+  <a href="#configuration">Configuration</a> &middot;
+  <a href="#security">Security</a> &middot;
+  <a href="docs/ROADMAP.md">Roadmap</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
+  <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js" />
+  <img src="https://img.shields.io/badge/MCP-compatible-purple" alt="MCP" />
+  <img src="https://img.shields.io/badge/self--hosted-privacy--first-orange" alt="Self-hosted" />
+</p>
+
+---
+
+Run agents on your machines — Claude Code, local LLMs, shell scripts, anything. AnyAgent connects them all to a single hub and exposes each one as an MCP tool that Claude Code, Cursor, or any MCP client can call. Manage the fleet from your terminal or Telegram.
 
 ```
- Claude Code / Cursor ──MCP──→  AnyAgent Hub  ──WebSocket──→  Workers (any machine)
-                                     ↕
-                            CLI / Telegram (management)
+ Claude Code ─── MCP ───→  AnyAgent Hub  ←── WebSocket ──── Workers
+ Cursor                        │ ↕ │                      (any machine)
+ Any MCP client           CLI   Telegram
+                       (manage from anywhere)
 ```
+
+### Why AnyAgent?
+
+- **One hub, all your agents.** Claude Code on your laptop calls your GPU server's Ollama. Your VPS shell agent runs deployments. All through MCP — no SSH, no manual switching.
+- **Zero lock-in.** Works with any binary: Claude CLI, Ollama, bash, Python scripts, local LLMs. Not tied to one AI provider.
+- **Self-hosted, private.** All data on your machines. No cloud. No telemetry. Air-gappable.
+- **Telegram optional.** Full management from your terminal. Add Telegram for mobile push notifications.
+- **5-minute setup.** Interactive wizard. One command per machine.
 
 ---
 
 ## Quick Start
 
-### Option A: Setup wizard (recommended)
+### 1. Set up the hub
 
 ```bash
 git clone https://github.com/GuilhermeBianeck/AnyAgent.git
 cd AnyAgent
-./setup.sh       # asks 2 questions, generates all secrets
+./setup.sh    # asks 2 questions, generates all secrets
 cd hub && npm start
 ```
 
-The hub starts with a CLI prompt. Telegram is optional — set `BOT_TOKEN` to enable it.
+> Hub starts with a CLI prompt. Telegram is optional — set `BOT_TOKEN` to enable.
 
-### Option B: Docker
-
-```bash
-cp .env.hub.example .env.hub       # edit with your tokens
-cp .env.worker.example .env.worker
-docker compose up -d
-```
-
-### Option C: Manual
-
-```bash
-cd hub && cp .env.example .env     # edit all values
-npm install && npm run build && npm start
-```
-
----
-
-## Add a Worker
+### 2. Add a worker
 
 On each machine you want to connect:
 
-**1.** Get a pairing code — type `pair` in the hub CLI, or send `/pair` in Telegram.
-
-**2.** On the worker machine:
-
 ```bash
+# In the hub CLI, type: pair (or send /pair in Telegram)
+# Copy the pairing code, then on the worker machine:
+
 git clone https://github.com/GuilhermeBianeck/AnyAgent.git
 cd AnyAgent
-./add-worker.sh    # wizard asks for hub URL, code, agent binary, capabilities
+./add-worker.sh
 cd worker && npm start
 ```
 
-Or with CLI flags (no wizard):
+Approve the pairing (`y` in CLI, or tap Approve in Telegram). Done — credentials auto-save for future restarts.
 
-```bash
-cd worker && node dist/index.js \
-  --hub ws://HUB_IP:8080 \
-  --pair PAIRING_CODE \
-  --name my-server \
-  --agents '[{"name":"claude","binary":"claude","args":[],"capabilities":["coding"]}]'
-```
-
-**3.** Approve the pairing in CLI (`y`) or Telegram (tap Approve). Credentials auto-save for future restarts.
-
----
-
-## Connect MCP Clients
+### 3. Connect MCP clients
 
 Add to your Claude Code / Cursor `.mcp.json`:
 
@@ -84,142 +85,117 @@ Add to your Claude Code / Cursor `.mcp.json`:
 }
 ```
 
-Your agents appear as MCP tools automatically.
+Your agents appear as MCP tools automatically. Try: *"Use anyagent_route to fix the bug in auth.ts"*
+
+### Docker alternative
+
+```bash
+cp .env.hub.example .env.hub       # edit with your tokens
+cp .env.worker.example .env.worker
+docker compose up -d
+```
 
 ---
 
 ## MCP Tools
+
+Every registered agent becomes an MCP tool. Plus these built-in tools:
 
 | Tool | Input | Description |
 |------|-------|-------------|
 | `anyagent_route` | `intent`, `timeout_ms?` | Route to best agent by capability. Set `timeout_ms` (max 120s) to block for result. |
 | `anyagent_<name>` | `intent`, `timeout_ms?` | Call a specific agent directly. One tool per registered agent. |
 | `anyagent_list_agents` | — | List all agents with capabilities and online/offline status. |
-| `anyagent_task_status` | `task_id` | Check task progress and result. |
+| `anyagent_task_status` | `task_id` | Check task progress and result by ID. |
 | `anyagent_context` | — | Read the operator's persistent context notes. |
 
+**Blocking mode:** Set `timeout_ms` to wait for the result inline. Without it, tool calls return a `task_id` for polling via `anyagent_task_status`.
+
 ---
 
-## Management Interfaces
+## Management
 
-AnyAgent has two management interfaces. Both have full feature parity. Use either or both simultaneously.
+AnyAgent has two management interfaces with full feature parity. Use either or both.
 
-### CLI Commands (always available)
+### CLI (always available)
+
+```
+anyagent> agents
+  ● claude — Claude Code [coding, refactoring]
+  ● shell — Bash executor [shell, scripts]
+  ○ ollama — Local LLM (offline)
+
+anyagent> route fix the authentication bug
+✓ claude started. Type to interact, "stop" to end.
+```
 
 | Command | Description |
 |---------|-------------|
-| `pair` | Generate a pairing code for a new worker |
-| `workers` | List workers with online/offline status |
-| `agents` | List agents with capabilities |
-| `call <name>` | Start a specific agent session |
-| `route <intent>` | Route by capability matching (interactive picker if ambiguous) |
-| `switch` | Switch to a different online agent |
-| `stop` | Stop the active session |
-| `tasks` | Show recent task history |
-| `retry <task_id>` | Retry a failed task |
-| `cancel <task_id>` | Cancel a queued task |
-| `y` / `n` / `trust` | Approve / deny / trust a pending task |
-| `default [name\|off]` | Set or clear the auto-start agent |
-| `approve [off\|mcp\|always]` | Set task approval mode |
-| `context [set\|add\|clear]` | Manage persistent operator context |
-| `revoke <node_id>` | Revoke a paired worker |
-| `purge` | Delete all task history |
-| `status` | Show current status |
-| *(any text)* | If session active: send as input. If default agent set: auto-route. |
+| `pair` | Generate pairing code |
+| `workers` | List workers |
+| `agents` | List agents |
+| `call <name>` | Start agent |
+| `route <intent>` | Route by capability |
+| `switch` | Switch agent |
+| `stop` | Stop session |
+| `tasks` | Task history |
+| `retry <id>` | Retry failed task |
+| `cancel <id>` | Cancel queued task |
+| `y` / `n` / `trust` | Approve / deny / trust pending task |
+| `default [name\|off]` | Auto-start agent |
+| `approve [off\|mcp\|always]` | Approval mode |
+| `context [set\|add\|clear]` | Operator context |
+| `revoke <node_id>` | Revoke worker |
+| `purge` | Clear history |
+| `status` | Current status |
 
-### Telegram Commands (optional — set `BOT_TOKEN` to enable)
+Any unrecognized text is forwarded as input to the active agent session.
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Show help, create pinned live status message |
-| `/pair` | Generate pairing code with ready-to-paste worker commands |
-| `/workers` | List workers (tap for detail, aliases: `/devices`, `/list`) |
-| `/agents` | List agents (tap to start) |
-| `/call <name>` | Start a specific agent |
-| `/switch` | Switch to a different agent |
-| `/stop` | Stop the active session |
-| `/tasks` | Show recent task history with status emoji |
-| `/default [name]` | Set auto-start agent (alias: `/delegate`) |
-| `/approve [off\|mcp\|always]` | Set task approval mode |
-| `/context [set\|add\|clear]` | Manage operator context |
-| `/revoke <node_id>` | Revoke a worker |
-| `/purge` | Delete all task history (with confirmation) |
-| `/status` | Update and pin live status message (auto-refreshes every 30s) |
+### Telegram (optional — set `BOT_TOKEN`)
 
-Telegram also provides inline buttons for: pairing approval, task approval/deny/trust, retry on failure, cancel queued tasks, and agent selection.
+Same commands with `/` prefix: `/pair`, `/workers`, `/agents`, `/call`, `/tasks`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
+
+Plus: inline buttons for pairing approval, task approval/deny/trust, retry, cancel, and agent selection. Live pinned status message auto-updates every 30 seconds.
 
 ---
 
-## Features
+## Configuration
 
-| Feature | Description |
-|---------|-------------|
-| **MCP bridge** | Agents on any machine become MCP tools callable by Claude Code, Cursor, or any MCP client |
-| **Telegram optional** | Full management from terminal CLI. Telegram adds mobile push + inline buttons when enabled |
-| **Task tracking** | Every request (CLI, Telegram, or MCP) is a persistent task with lifecycle tracking |
-| **Capability routing** | Hub matches your intent to the right agent by keyword scoring on capabilities |
-| **Task queue** | Busy agents queue tasks (FIFO, max 3). Tasks auto-start when the current one finishes |
-| **Retry** | Failed tasks show retry option. Error context injected on retry. Max 3 retries |
-| **Task approval** | Optional gate: require Telegram/CLI confirmation before agents run (per-agent trust) |
-| **Persistent context** | Operator notes + recent task history injected into agent spawns |
-| **Structured output** | Agents can send status, progress, result, error messages (rendered in CLI and Telegram) |
-| **Legacy TTY** | Raw terminal I/O for interactive agents (Claude CLI, bash, etc.) |
-| **Privacy-first** | All data on your machines. No cloud. No telemetry. Fully air-gappable |
+### Hub
 
----
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOWED_USER_ID` | *required* | Your Telegram user ID (numeric) |
+| `BOT_TOKEN` | — | Telegram bot token. Omit to run CLI-only. |
+| `WS_PORT` | `8080` | WebSocket port for workers |
+| `WS_SECRET` | — | Shared secret for worker auth (recommended) |
+| `MCP_PORT` | `3000` | MCP HTTP server port |
+| `MCP_TOKEN` | — | MCP bearer token. Omit to disable MCP server. |
+| `SESSION_TIMEOUT_MS` | `1800000` | Inactivity timeout (30 min) |
+| `MAX_QUEUE_DEPTH` | `3` | Max queued tasks per worker |
 
-## Configuration Reference
+### Worker
 
-### Hub environment variables
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HUB_URL` | `ws://localhost:8080` | Hub WebSocket URL |
+| `PAIR_CODE` | — | One-time pairing code (first run only) |
+| `WS_SECRET` | — | Must match hub if set |
+| `WORKER_NAME` | hostname | Display name |
+| `WORKER_AGENTS` | *required* | JSON array of agent declarations |
 
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `ALLOWED_USER_ID` | Yes | — | Your Telegram user ID (numeric) |
-| `BOT_TOKEN` | No | — | Telegram bot token. If unset, Telegram disabled. |
-| `WS_PORT` | No | `8080` | WebSocket port for workers |
-| `WS_SECRET` | No | — | Shared secret for worker transport auth |
-| `MCP_PORT` | No | `3000` | HTTP port for MCP server |
-| `MCP_TOKEN` | No | — | Bearer token for MCP auth. If unset, MCP disabled. |
-| `SESSION_TIMEOUT_MS` | No | `1800000` | Session inactivity timeout (ms) |
-| `MAX_QUEUE_DEPTH` | No | `3` | Max queued tasks per worker |
+Worker also accepts CLI flags: `--hub`, `--pair`, `--secret`, `--name`, `--agents`, `--help`.
 
-### Worker environment variables
-
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `HUB_URL` | No | `ws://localhost:8080` | Hub WebSocket URL |
-| `PAIR_CODE` | First time | — | From `/pair` or `pair` command |
-| `WS_SECRET` | If hub has it | — | Must match hub's WS_SECRET |
-| `WORKER_NAME` | No | hostname | Worker display name |
-| `WORKER_DESCRIPTION` | No | — | Worker description |
-| `WORKER_AGENTS` | Yes | — | JSON array of agent declarations |
-| `NODE_ID` | Auto-saved | — | Assigned after pairing |
-| `PRIVATE_KEY_HEX` | Auto-saved | — | Ed25519 private key (auto-generated) |
-
-### Worker CLI flags (override env vars)
-
-```
---hub <url>       Hub WebSocket URL
---pair <code>     Pairing code
---secret <token>  WS_SECRET
---name <name>     Worker display name
---desc <text>     Worker description
---agents <json>   Agent declarations as JSON
---help            Show usage
-```
-
-### Agent declaration format
+### Agent declaration
 
 ```json
-[
-  {
-    "name": "claude",
-    "binary": "claude",
-    "args": [],
-    "description": "Claude Code AI assistant",
-    "capabilities": ["coding", "refactoring", "testing"]
-  }
-]
+[{
+  "name": "claude",
+  "binary": "claude",
+  "args": [],
+  "description": "Claude Code AI assistant",
+  "capabilities": ["coding", "refactoring", "testing"]
+}]
 ```
 
 ---
@@ -237,50 +213,63 @@ Telegram also provides inline buttons for: pairing approval, task approval/deny/
                        db.ts (SQLite)
 ```
 
-| Component | What it does |
-|-----------|-------------|
-| **manager.ts** | Pure business logic: routing, task lifecycle, queue, approval, context. No UI deps. |
-| **bot.ts** | Telegram frontend (optional). Calls manager, renders results as Telegram messages. |
-| **cli.ts** | Terminal frontend (always active). Same manager calls, rendered as ANSI text. |
-| **mcp.ts** | MCP server. Exposes agents as tools. Calls manager for routing and spawning. |
-| **gateway.ts** | WebSocket server. Worker auth, heartbeat, binary frame relay, event callbacks. |
-| **db.ts** | SQLite: tasks, agents, nodes, sessions, approval config, default agents. |
-| **context.ts** | Persistent operator notes stored as Markdown file. |
+| Module | Role |
+|--------|------|
+| **manager.ts** | Pure business logic: routing, tasks, queue, approval, context. No UI. |
+| **cli.ts** | Terminal interface. Always active. |
+| **bot.ts** | Telegram interface. Optional. |
+| **mcp.ts** | MCP server. Exposes agents as tools. |
+| **gateway.ts** | WebSocket server. Worker auth, heartbeat, I/O relay. |
 | **sdk/** | Worker SDK: connection, auth, structured output helpers. |
+
+---
 
 ## Security
 
-- Ed25519 challenge-response authentication (no passwords transmitted)
-- Timing-safe comparison for MCP bearer token and WS_SECRET
-- Binary allowlist on workers — only declared agents can be spawned
-- Environment sanitization — child processes don't receive private keys
-- `.env` files written with owner-only permissions (0600)
-- Agent names namespaced per worker — one worker can't hijack another's agents
-- Output ownership verification — workers can't spoof other workers' task results
-- Task approval gate — optional human confirmation before agents run
-- Session takeover prevention — new auth terminates prior connection for same node
-- 1MB max payload on WebSocket and MCP HTTP
-- Docker containers run as non-root user
-- 30-day auto-cleanup of old tasks
-- Node revocation via `/revoke` command
+- Ed25519 challenge-response authentication
+- Timing-safe token comparison (MCP + WebSocket)
+- Binary allowlist — only declared agents can spawn
+- Environment sanitization — child processes don't see private keys
+- `.env` files written with 0600 permissions
+- Agent namespacing per worker — no cross-worker hijacking
+- Output ownership verification — workers can't spoof other workers' results
+- Task approval gate — optional human confirmation before execution
+- Session takeover prevention — new auth terminates prior connection
+- 1MB max payload (WebSocket + MCP HTTP)
+- Non-root Docker containers
+- Node revocation via `revoke` command
+- 30-day auto-cleanup of task history
 
-See [docs/PRIVACY.md](docs/PRIVACY.md) for the full privacy model.
+See [PRIVACY.md](docs/PRIVACY.md) for the full trust model.
+
+---
+
+## Contributing
+
+Found a bug? Have a feature idea? [Open an issue](https://github.com/GuilhermeBianeck/AnyAgent/issues).
+
+Want to contribute code? See the [architecture section](#architecture) for module boundaries. The codebase is TypeScript (hub + SDK) with a clean separation: `manager.ts` owns business logic, frontends (`bot.ts`, `cli.ts`, `mcp.ts`) own rendering.
+
+```bash
+cd hub && npm run dev    # hot-reload development
+cd worker && npm run dev
+```
 
 ---
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Privacy Model](docs/PRIVACY.md) | What data flows through Telegram vs stays local, retention, recommendations |
-| [Product Requirements](docs/PRD-v2-agent-control-plane.md) | Full PRD with goals, requirements, acceptance criteria |
-| [Market Comparison](docs/MARKET-COMPARISON.md) | AnyAgent vs Manus, OpenClaw, AgentGateway, Claude Channels, n8n |
-| [User Personas](docs/USER-TESTING-personas.md) | 5 persona evaluations with feedback and gap analysis |
-| [Research Validation](docs/RESEARCH-requirement-validation.md) | Market research validating the "Personal MCP Bridge" niche |
-| [Roadmap](docs/ROADMAP.md) | 6-phase plan: npm publish → CLI mode → Python SDK → recipes → community |
+| | |
+|---|---|
+| [Privacy Model](docs/PRIVACY.md) | What Telegram sees, what stays local, retention policy |
+| [Roadmap](docs/ROADMAP.md) | 6-phase plan from npm publish to community building |
+| [Market Comparison](docs/MARKET-COMPARISON.md) | AnyAgent vs Manus, OpenClaw, AgentGateway, Claude Channels |
+| [Product Requirements](docs/PRD-v2-agent-control-plane.md) | Goals, requirements, acceptance criteria |
+| [User Personas](docs/USER-TESTING-personas.md) | 5 persona evaluations with actionable feedback |
+| [Research](docs/RESEARCH-requirement-validation.md) | Market validation for the "Personal MCP Bridge" niche |
 
 ---
 
-## License
-
-MIT
+<p align="center">
+  <strong>MIT License</strong>
+</p>
