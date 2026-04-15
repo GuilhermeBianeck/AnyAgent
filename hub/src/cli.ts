@@ -138,6 +138,7 @@ ${BOLD}Usage${RESET}
   switch              Switch to a different agent
   stop                Stop the active session
   tasks               Show recent task history
+  history [task_id]   Full history (detail with ID)
   retry <task_id>     Retry a failed task
   cancel <task_id>    Cancel a queued task
   y / yes             Approve pending task
@@ -266,6 +267,47 @@ ${BOLD}Config${RESET}
           if (t.error) {
             console.log(`    ${RED}✗ ${t.error}${RESET}`);
           }
+        }
+        break;
+      }
+
+      case 'history': {
+        if (argStr) {
+          // history <task_id> — show full detail
+          const task = getTask(argStr);
+          if (!task) { console.log(`${RED}Task "${argStr}" not found.${RESET}`); break; }
+          console.log(`${BOLD}Task Detail${RESET}`);
+          console.log(`  ID:      ${task.task_id}`);
+          console.log(`  Status:  ${taskIcon(task.status as TaskStatus)} ${task.status}`);
+          console.log(`  Source:  ${task.source}`);
+          if (task.agent_name) console.log(`  Agent:   ${task.agent_name}`);
+          if (task.node_id) console.log(`  Node:    ${task.node_id}`);
+          if (task.routing_method) console.log(`  Routing: ${task.routing_method}`);
+          if (task.retry_count > 0) console.log(`  Retries: ${task.retry_count}`);
+          console.log(`  Created: ${task.created_at}`);
+          console.log(`  Updated: ${task.updated_at}`);
+          console.log(`\n  ${BOLD}Intent:${RESET}\n  ${task.intent}`);
+          if (task.result_summary) console.log(`\n  ${BOLD}Result:${RESET}\n  ${task.result_summary}`);
+          if (task.error) console.log(`\n  ${RED}Error: ${task.error}${RESET}`);
+        } else {
+          // history — show last 20 tasks
+          const tasks = getRecentTasks(CLI_CHAT_ID, 20);
+          if (tasks.length === 0) { console.log('No task history yet.'); break; }
+          console.log(`${BOLD}Task history:${RESET}`);
+          for (const t of tasks) {
+            const intent = t.intent.length > 40 ? t.intent.slice(0, 40) + '...' : t.intent;
+            const agent = t.agent_name ? ` → ${t.agent_name}` : '';
+            const src = t.source === 'mcp' ? ' (MCP)' : t.source === 'telegram' ? ' (TG)' : '';
+            console.log(`  ${taskIcon(t.status as TaskStatus)} ${DIM}${t.task_id.slice(0, 12)}${RESET}${agent}${src}  ${intent}`);
+            if (t.result_summary) {
+              const s = t.result_summary.length > 60 ? t.result_summary.slice(0, 60) + '...' : t.result_summary;
+              console.log(`    ${DIM}→ ${s}${RESET}`);
+            }
+            if (t.error) {
+              console.log(`    ${RED}✗ ${t.error}${RESET}`);
+            }
+          }
+          console.log(`\n${DIM}Use "history <task_id>" for full detail.${RESET}`);
         }
         break;
       }
