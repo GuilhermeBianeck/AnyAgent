@@ -122,6 +122,28 @@ function statusEmoji(status: TaskStatus): string {
   }
 }
 
+function formatTaskDetail(t: import('./types.js').TaskRow): string {
+  const emoji = statusEmoji(t.status as TaskStatus);
+  let text = `${emoji} <b>Task Detail</b>\n\n`;
+  text += `<b>ID:</b> <code>${escapeHtml(t.task_id)}</code>\n`;
+  text += `<b>Status:</b> ${t.status}\n`;
+  text += `<b>Source:</b> ${t.source}\n`;
+  if (t.agent_name) text += `<b>Agent:</b> ${escapeHtml(t.agent_name)}\n`;
+  if (t.node_id) text += `<b>Node:</b> <code>${escapeHtml(t.node_id)}</code>\n`;
+  if (t.routing_method) text += `<b>Routing:</b> ${t.routing_method}\n`;
+  if (t.retry_count > 0) text += `<b>Retries:</b> ${t.retry_count}\n`;
+  text += `<b>Created:</b> ${escapeHtml(t.created_at)}\n`;
+  text += `<b>Updated:</b> ${escapeHtml(t.updated_at)}\n`;
+  text += `\n<b>Intent:</b>\n${escapeHtml(t.intent)}\n`;
+  if (t.result_summary) {
+    text += `\n<b>Result:</b>\n${escapeHtml(t.result_summary)}\n`;
+  }
+  if (t.error) {
+    text += `\n<b>Error:</b>\n❌ ${escapeHtml(t.error)}\n`;
+  }
+  return text;
+}
+
 export interface BotConfig {
   wsPort: number;
   wsSecret?: string;
@@ -328,6 +350,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       '/agents — List agents (tap to start)\n' +
       '/call <code>&lt;name&gt;</code> — Start an agent session\n' +
       '/tasks — Recent task history\n' +
+      '/history — Full task history (tap for detail)\n' +
       '/stop — Stop the active session\n\n' +
       '<b>Config</b>\n' +
       '/default — Set an auto-start agent\n' +
@@ -442,6 +465,44 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       text += '\n';
     }
     await sendHtml(ctx, text);
+  });
+
+  // --- /history (P1-1: Task History) ---
+  bot.command('history', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+    // /history <task_id> — show full detail for a specific task
+    if (arg) {
+      const task = getTask(arg);
+      if (!task) {
+        await sendHtml(ctx, `❌ Task <code>${escapeHtml(arg)}</code> not found.`);
+        return;
+      }
+      await sendHtml(ctx, formatTaskDetail(task));
+      return;
+    }
+
+    // /history — show last 20 tasks with inline buttons for detail view
+    const tasks = getRecentTasksByChatId(ctx.chat!.id, 20);
+    if (tasks.length === 0) {
+      await ctx.reply('No task history yet.');
+      return;
+    }
+    let text = '<b>Task history:</b>\n\n';
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (const t of tasks) {
+      const emoji = statusEmoji(t.status as TaskStatus);
+      const intent = t.intent.length > 40 ? t.intent.slice(0, 40) + '...' : t.intent;
+      const agent = t.agent_name ? ` → ${escapeHtml(t.agent_name)}` : '';
+      const src = t.source === 'mcp' ? ' (MCP)' : t.source === 'cli' ? ' (CLI)' : '';
+      const result = t.result_summary
+        ? `\n   → ${escapeHtml(t.result_summary.length > 50 ? t.result_summary.slice(0, 50) + '...' : t.result_summary)}`
+        : '';
+      text += `${emoji} <code>${escapeHtml(t.task_id.slice(0, 8))}</code>${agent}${src} ${escapeHtml(intent)}${result}\n`;
+      buttons.push([{ text: `${emoji} ${t.task_id.slice(0, 8)} — ${intent}`, callback_data: `taskdetail:${t.task_id}` }]);
+    }
+    await sendHtml(ctx, text, { reply_markup: { inline_keyboard: buttons } });
   });
 
   // --- /switch ---
@@ -903,6 +964,19 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
 
     { const _r = startAgentForTask(agent, taskId, task.intent, ctx.chat!.id, 'user_selected'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
+  });
+
+  // --- Callback: task detail (P1-1 inline history) ---
+  bot.callbackQuery(/^taskdetail:(.+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const taskId = ctx.match[1];
+    const task = getTask(taskId);
+    if (!task) {
+      await ctx.answerCallbackQuery({ text: 'Task not found.' });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await sendHtml(ctx, formatTaskDetail(task));
   });
 
   // --- Plain text → route via capability matching ---
