@@ -41,6 +41,14 @@ Run agents on your machines — Claude Code, local LLMs, shell scripts, anything
 
 ---
 
+## Prerequisites
+
+- **Node.js 18+** — `node -v` to check
+- **Build tools** — needed for native modules (better-sqlite3, node-pty):
+  - macOS: `xcode-select --install`
+  - Ubuntu/Debian: `sudo apt install python3 build-essential`
+  - Alpine (Docker): `apk add python3 build-base`
+
 ## Quick Start
 
 ### 1. Set up the hub

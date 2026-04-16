@@ -31,6 +31,23 @@ fi
 
 echo -e "${GREEN}✓${NC} Node.js $(node -v)"
 
+# Check build tools (needed for native modules: better-sqlite3, node-pty)
+if ! command -v python3 &> /dev/null; then
+  echo -e "${YELLOW}python3 not found. Native modules need build tools.${NC}"
+  echo "  macOS:         xcode-select --install"
+  echo "  Ubuntu/Debian: sudo apt install python3 build-essential"
+  exit 1
+fi
+
+if ! (command -v make &> /dev/null && command -v g++ &> /dev/null) && ! (command -v cc &> /dev/null); then
+  echo -e "${YELLOW}Build tools (make/g++ or cc) not found. Native modules need them.${NC}"
+  echo "  macOS:         xcode-select --install"
+  echo "  Ubuntu/Debian: sudo apt install build-essential"
+  exit 1
+fi
+
+echo -e "${GREEN}✓${NC} Build tools available"
+
 # Step 1: Telegram bot token
 echo ""
 echo -e "${BOLD}Step 1: Telegram Bot (optional)${NC}"

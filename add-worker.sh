@@ -22,6 +22,15 @@ fi
 
 echo -e "${GREEN}✓${NC} Node.js $(node -v)"
 
+# Check build tools
+if ! command -v python3 &> /dev/null; then
+  echo -e "${YELLOW}python3 not found. Install build tools first:${NC}"
+  echo "  macOS: xcode-select --install"
+  echo "  Ubuntu: sudo apt install python3 build-essential"
+  exit 1
+fi
+echo -e "${GREEN}✓${NC} Build tools available"
+
 # Step 1: Hub URL
 echo ""
 echo -e "${BOLD}Step 1: Hub connection${NC}"
