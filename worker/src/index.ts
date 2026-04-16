@@ -99,6 +99,10 @@ const worker = createWorker(HUB_URL, config, {
       );
       activeTerminal = session;
       worker.sendSpawnResult(true, session.pid);
+      // Send the task intent/context as the first stdin input so the agent knows what to do
+      if (params.context) {
+        session.write(params.context + '\n');
+      }
     } catch (err: unknown) {
       worker.sendSpawnResult(false, undefined, 'Spawn failed');
       worker.sendError('Spawn failed');

@@ -33,41 +33,44 @@ echo -e "${GREEN}✓${NC} Node.js $(node -v)"
 
 # Step 1: Telegram bot token
 echo ""
-echo -e "${BOLD}Step 1: Telegram Bot${NC}"
-echo "  Open Telegram → @BotFather → /newbot → follow prompts → copy token"
+echo -e "${BOLD}Step 1: Telegram Bot (optional)${NC}"
+echo "  For mobile management: @BotFather → /newbot → copy token"
+echo "  Press Enter to skip (CLI-only mode)."
 echo ""
-read -p "  Paste your BOT_TOKEN: " BOT_TOKEN
+read -p "  BOT_TOKEN (or Enter to skip): " BOT_TOKEN
 
-if [ -z "$BOT_TOKEN" ]; then
-  echo "BOT_TOKEN is required. Exiting."
-  exit 1
-fi
+ALLOWED_USER_ID=""
+if [ -n "$BOT_TOKEN" ]; then
+  # Validate BOT_TOKEN format
+  if ! echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$'; then
+    echo -e "${YELLOW}Warning: doesn't match Telegram format (digits:alphanumeric).${NC}"
+    read -p "  Continue anyway? [y/N]: " CONFIRM
+    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+      exit 1
+    fi
+  fi
 
-# Validate BOT_TOKEN format (digits:alphanumeric)
-if ! echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$'; then
-  echo -e "${YELLOW}Warning: BOT_TOKEN doesn't match expected Telegram format (digits:alphanumeric).${NC}"
-  read -p "  Continue anyway? [y/N]: " CONFIRM
-  if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+  echo ""
+  echo -e "${BOLD}Step 2: Your Telegram User ID${NC}"
+  echo "  Open Telegram → @userinfobot → send /start → copy your ID"
+  echo ""
+  read -p "  ALLOWED_USER_ID: " ALLOWED_USER_ID
+
+  if [ -z "$ALLOWED_USER_ID" ]; then
+    echo "ALLOWED_USER_ID is required when BOT_TOKEN is set. Exiting."
     exit 1
   fi
-fi
 
-# Step 2: Your Telegram user ID
-echo ""
-echo -e "${BOLD}Step 2: Your Telegram User ID${NC}"
-echo "  Open Telegram → @userinfobot → send /start → copy your ID number"
-echo ""
-read -p "  Paste your ALLOWED_USER_ID: " ALLOWED_USER_ID
+  # Validate numeric
+  if ! echo "$ALLOWED_USER_ID" | grep -qE '^[0-9]+$'; then
+    echo "ALLOWED_USER_ID must be a number. Exiting."
+    exit 1
+  fi
 
-if [ -z "$ALLOWED_USER_ID" ]; then
-  echo "ALLOWED_USER_ID is required. Exiting."
-  exit 1
-fi
-
-# Validate user ID is numeric
-if ! echo "$ALLOWED_USER_ID" | grep -qE '^[0-9]+$'; then
-  echo "ALLOWED_USER_ID must be a number. Exiting."
-  exit 1
+  echo -e "${GREEN}✓${NC} Telegram enabled"
+else
+  echo -e "${GREEN}✓${NC} CLI-only mode (no Telegram)"
+  ALLOWED_USER_ID="0"
 fi
 
 # Step 3: Auto-generate secrets
@@ -82,7 +85,9 @@ echo ""
 echo -e "${BOLD}Step 3: Installing hub...${NC}"
 
 {
-  printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+  if [ -n "$BOT_TOKEN" ]; then
+    printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+  fi
   printf 'ALLOWED_USER_ID=%s\n' "$ALLOWED_USER_ID"
   printf 'WS_PORT=8080\n'
   printf 'WS_SECRET=%s\n' "$WS_SECRET"

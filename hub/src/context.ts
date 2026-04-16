@@ -47,7 +47,7 @@ export function buildSpawnContext(chatId: number | null, intent: string): string
   }
 
   // Recent completed tasks (last 5)
-  if (chatId) {
+  if (chatId !== null && chatId !== undefined) {
     const recent = getRecentCompletedTasksByChatId(chatId, 5);
     if (recent.length > 0) {
       parts.push('[Recent tasks]');

@@ -176,7 +176,7 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
 
     const next = queued[0];
     const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
-    if (!agent || !next.chat_id) {
+    if (!agent) {
       updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
       continue;
     }
@@ -190,9 +190,9 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
       continue;
     }
 
-    setActiveSession(agent.node_id, next.chat_id, agent.name);
+    setActiveSession(agent.node_id, next.chat_id ?? 0, agent.name);
     updateTaskStatus(next.task_id, 'running');
-    return { outcome: 'started', taskId: next.task_id, agentName: agent.name, chatId: next.chat_id };
+    return { outcome: 'started', taskId: next.task_id, agentName: agent.name, chatId: next.chat_id ?? undefined };
   }
 }
 

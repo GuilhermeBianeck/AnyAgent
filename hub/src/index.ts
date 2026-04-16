@@ -13,8 +13,8 @@ const WS_SECRET = process.env.WS_SECRET;
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? '3000', 10);
 const MCP_TOKEN = process.env.MCP_TOKEN;
 
-if (!ALLOWED_USER_ID) throw new Error('ALLOWED_USER_ID env var required');
-const allowedUserId = parseInt(ALLOWED_USER_ID, 10);
+if (BOT_TOKEN && !ALLOWED_USER_ID) throw new Error('ALLOWED_USER_ID env var required when BOT_TOKEN is set');
+const allowedUserId = parseInt(ALLOWED_USER_ID ?? '0', 10);
 
 // Startup cleanup
 const stale = failStaleTasks();

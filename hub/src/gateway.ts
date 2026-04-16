@@ -420,6 +420,11 @@ async function handleMessage(
       const params = req.params as SpawnResult;
       console.log(`[gateway] spawn_result from node ${session.nodeId}: success=${params.success}`);
       if (!params.success && session.nodeId) {
+        // Mark running tasks as failed
+        const runningTasks = getRunningTasksByNodeId(session.nodeId);
+        for (const task of runningTasks) {
+          updateTaskStatus(task.task_id, 'failed', { error: params.error ?? 'Spawn failed' });
+        }
         const active = getActiveSession(session.nodeId);
         if (active) {
           const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Process';

@@ -39,7 +39,7 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
   }
 
   const taskId = createTaskId();
-  insertTask(taskId, 'mcp', intent);
+  insertTask(taskId, 'mcp', intent, 0); // chatId=0 for MCP tasks
 
   // Use manager.startAgentForTask — includes approval gate + context injection
   const result = startAgentForTask(agent, taskId, intent, 0, routingMethod);

@@ -40,7 +40,7 @@ read -p "  WS_SECRET: " WS_SECRET
 # Step 3: Pair code
 echo ""
 echo -e "${BOLD}Step 3: Pairing code${NC}"
-echo "  In Telegram, send ${CYAN}/pair${NC} to your bot and paste the code here."
+echo "  In the hub CLI type ${CYAN}pair${NC} (or send ${CYAN}/pair${NC} in Telegram) and paste the code here."
 echo ""
 read -p "  Pairing code: " PAIR_CODE
 

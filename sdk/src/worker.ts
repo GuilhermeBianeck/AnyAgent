@@ -240,6 +240,9 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
             sendDeclare(ws, config);
           } else {
             console.error('[sdk] Pairing rejected:', params.error);
+            // Clear PAIR_CODE to prevent infinite retry with consumed code
+            delete process.env.PAIR_CODE;
+            console.error('[sdk] NOT retrying (pairing was rejected). Get a new code and restart.');
             ws.close();
           }
           break;
@@ -297,6 +300,12 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
         console.error('[sdk] Connection rejected: WS_SECRET mismatch. Check WS_SECRET env var on this worker.');
         console.error('[sdk] NOT retrying (fix WS_SECRET and restart).');
         return; // Do not retry — wrong secret will fail forever
+      }
+
+      // Don't retry if pairing was rejected (code consumed, no point retrying)
+      if (!process.env.NODE_ID && !process.env.PAIR_CODE) {
+        console.error('[sdk] No credentials and no pair code. Cannot reconnect. Restart with a new PAIR_CODE.');
+        return;
       }
 
       if (code === 1000) {
