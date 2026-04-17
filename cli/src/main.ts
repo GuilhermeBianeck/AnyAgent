@@ -42,6 +42,11 @@ async function main(): Promise<number> {
       return await runHub();
     }
 
+    case 'worker': {
+      const { runWorkerCommand } = await import('./commands/worker.js');
+      return await runWorkerCommand(rest);
+    }
+
     case 'pair': {
       const { runPair } = await import('./commands/pair.js');
       return await runPair(rest);
@@ -96,6 +101,7 @@ USAGE
 
 COMMANDS
   hub                  Start the hub server (ws on :8080, MCP on :3000)
+  worker               Start the worker (connects to a hub)
   quickstart           Start hub + wire MCP client config (hub-side only)
   pair                 Print a fresh pair code and exit
   wire-mcp             Inject the anyagent entry into ~/.claude.json (or --config <file>)
@@ -104,18 +110,16 @@ COMMANDS
   help                 Show this help
 
 ENVIRONMENT
-  Hub reads ./hub/.env or $ANYAGENT_HUB_DIR/.env.
-  Every env var documented in README is honored (WS_PORT, MCP_TOKEN, AUDIT_NETWORK, AIRGAP, ...).
+  Hub reads ./.env in the current directory (or \$ANYAGENT_HUB_DIR/.env).
+  Worker reads ./.env (HUB_URL, PAIR_CODE, WORKER_AGENTS, ...).
+  Every env var documented in the README is honored.
 
 EXAMPLES
   anyagent quickstart                        # hub + wire Claude Code
   anyagent hub                               # start a paired hub
+  anyagent worker --hub ws://HUB:8080 --pair CODE
   anyagent pair                              # generate a code to hand a worker
-  anyagent wire-mcp --url http://HUB:3000 --token $MCP_TOKEN
-
-On the worker machine (separate install — needs node-pty):
-  npm i -g @anyagent/worker
-  anyagent-worker --hub ws://HUB:8080 --pair CODE
+  anyagent wire-mcp --url http://HUB:3000 --token \$MCP_TOKEN
 `);
 }
 

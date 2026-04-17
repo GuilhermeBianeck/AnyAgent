@@ -59,6 +59,29 @@ if [ ! -d hub/node_modules ]; then
   echo -e "${DIM}installing hub deps...${NC}"
   (cd hub && npm ci --silent) || (cd hub && npm install --silent)
 fi
+# Worker deps include node-pty, whose prebuild we embed as a SEA asset. If
+# node_modules is missing we install; if node-pty is missing specifically,
+# npm will fetch the appropriate prebuild for this platform.
+if [ ! -d worker/node_modules/node-pty ]; then
+  echo -e "${DIM}installing worker deps (for node-pty prebuild)...${NC}"
+  (cd worker && npm ci --silent) || (cd worker && npm install --silent)
+fi
+
+# --- locate the node-pty prebuild directory for this target ---------------
+# On Unix we need two files: pty.node (addon) + spawn-helper (executable).
+# On Windows node-pty uses a different stack (not shipped via SEA yet).
+PREBUILD_DIR_REL="worker/node_modules/node-pty/prebuilds/${OS}-${ARCH}"
+PTY_PREBUILD_ABS="$(cd "$REPO_ROOT/$PREBUILD_DIR_REL" 2>/dev/null && pwd)/pty.node"
+SPAWN_HELPER_ABS="$(cd "$REPO_ROOT/$PREBUILD_DIR_REL" 2>/dev/null && pwd)/spawn-helper"
+if [ ! -f "$PTY_PREBUILD_ABS" ] || [ ! -f "$SPAWN_HELPER_ABS" ]; then
+  echo "node-pty prebuild missing for $OS-$ARCH." >&2
+  echo "Looked in: $PREBUILD_DIR_REL" >&2
+  echo "Available:" >&2
+  ls "$REPO_ROOT/worker/node_modules/node-pty/prebuilds/" 2>&1 | sed 's/^/  /' >&2
+  exit 1
+fi
+echo -e "${GREEN}✓${NC} pty.node prebuild: ${DIM}$PTY_PREBUILD_ABS${NC}"
+echo -e "${GREEN}✓${NC} spawn-helper:      ${DIM}$SPAWN_HELPER_ABS${NC}"
 
 # --- 1. typecheck cli (catch type errors before bundle) ----------------------
 echo -e "${DIM}typecheck cli...${NC}"
@@ -72,8 +95,26 @@ echo -e "${DIM}bundling with esbuild...${NC}"
 (cd "$REPO_ROOT/cli" && node bundle.mjs)
 
 # --- 3. build SEA blob -------------------------------------------------------
-echo -e "${DIM}generating SEA blob...${NC}"
-(cd "$SCRIPT_DIR" && node --experimental-sea-config sea-config.json)
+# Write a platform-specific sea-config with the pty.node asset path injected.
+# We keep the tracked sea-config.json minimal; this generated file lives in
+# build/ and is gitignored.
+GEN_CONFIG="$SCRIPT_DIR/build/sea-config.generated.json"
+cat > "$GEN_CONFIG" <<EOF
+{
+  "main": "main.cjs",
+  "output": "sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": true,
+  "assets": {
+    "pty.node": "$PTY_PREBUILD_ABS",
+    "spawn-helper": "$SPAWN_HELPER_ABS"
+  }
+}
+EOF
+
+echo -e "${DIM}generating SEA blob (with pty.node asset)...${NC}"
+(cd "$SCRIPT_DIR/build" && node --experimental-sea-config sea-config.generated.json)
 echo -e "${GREEN}✓${NC} blob: $(du -h "$SCRIPT_DIR/build/sea-prep.blob" | cut -f1)"
 
 # --- 4. copy `node` → target binary ------------------------------------------

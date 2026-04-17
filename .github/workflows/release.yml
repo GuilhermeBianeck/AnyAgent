@@ -51,9 +51,14 @@ jobs:
             hub/package-lock.json
             cli/package-lock.json
 
-      - name: Install hub + cli deps
+      - name: Install hub + cli + worker deps
+        # Worker deps are required because the SEA build embeds node-pty's
+        # prebuilds (pty.node + spawn-helper) as SEA assets for the target
+        # platform. Also build the sdk since the worker imports it.
         run: |
+          (cd sdk && npm ci && npm run build)
           (cd hub && npm ci)
+          (cd worker && npm ci)
           (cd cli && npm ci)
 
       - name: Build SEA binary

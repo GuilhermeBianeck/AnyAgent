@@ -59,21 +59,20 @@ curl -fsSL https://raw.githubusercontent.com/GuilhermeBianeck/AnyAgent/main/pack
 anyagent quickstart
 ```
 
-Installs a ~110MB single-file binary at `~/.local/bin/anyagent`. Runs the hub, writes the MCP entry into your Claude Code / Cursor config, prints the one-liner to add a worker. The binary embeds Node 22 — the target machine needs nothing else.
+Installs a ~110MB single-file binary at `~/.local/bin/anyagent`. The binary bundles Node 22, the hub, the worker, **and** the native `pty.node` + `spawn-helper` — nothing else to install. `anyagent quickstart`:
 
-For the worker side on the same machine:
+1. Detects a local AI CLI (`claude`, `codex`, `aider`, `ollama`, `gemini`, or `bash`)
+2. Writes `./anyagent-hub/.env` and `./anyagent-worker/.env` with generated secrets
+3. Starts the hub + a local worker as child processes (auto-paired over loopback)
+4. Injects the `anyagent` entry into `~/.claude.json` (backs up first)
 
-```bash
-npm i -g @anyagent/worker
-anyagent-worker --hub ws://127.0.0.1:8080 --pair "$(anyagent pair)"
-```
+When it's done, reopen Claude Code. Ctrl+C stops both processes.
 
-(Worker still needs npm because `node-pty` is native; hub alone is zero-install.)
-
-Other binary commands:
+Available subcommands:
 
 ```bash
-anyagent hub             # start the hub (uses ./env or $ANYAGENT_HUB_DIR)
+anyagent hub             # run a hub only (uses ./.env or $ANYAGENT_HUB_DIR)
+anyagent worker          # run a worker (reads ./.env — HUB_URL, PAIR_CODE, WORKER_AGENTS)
 anyagent pair            # print a fresh pair code
 anyagent wire-mcp ...    # inject the anyagent entry into an MCP config
 anyagent doctor PATH     # validate a worker .env

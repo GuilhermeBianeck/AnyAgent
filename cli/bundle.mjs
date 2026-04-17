@@ -19,8 +19,8 @@
 
 import esbuild from 'esbuild';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { readFileSync, mkdirSync } from 'fs';
+import { dirname, join, resolve } from 'path';
+import { readFileSync, mkdirSync, existsSync } from 'fs';
 
 // This script lives in cli/ so `import esbuild from 'esbuild'` resolves against
 // cli/node_modules. The output still goes to packaging/sea/build/ so the SEA
@@ -39,6 +39,53 @@ mkdirSync(outDir, { recursive: true });
 // Read version from hub/package.json so builds are self-identifying
 const hubPkg = JSON.parse(readFileSync(join(repoRoot, 'hub', 'package.json'), 'utf-8'));
 const version = hubPkg.version ?? '0.0.0';
+
+// Resolve node-pty/lib/utils.js to our shim so `require('./utils')` from
+// inside node-pty's bundled code returns the SEA-asset loader. Without this
+// the bundled worker would try to require a .node file that doesn't exist in
+// the virtual SEA filesystem.
+const shimPath = resolve(__dirname, 'src', 'node-pty-shim.cjs');
+if (!existsSync(shimPath)) {
+  throw new Error(`[bundle] node-pty shim missing: ${shimPath}`);
+}
+
+// Locate node-pty/lib/utils.js under worker's node_modules — esbuild follows
+// imports from the cli entry → worker/src/run.ts → @anyagent/sdk and worker
+// sources → node-pty. By pinning the target we make sure we only shim the
+// specific file, not anything else that happens to be called utils.js.
+const nodePtyUtilsPath = (() => {
+  const candidates = [
+    join(repoRoot, 'worker', 'node_modules', 'node-pty', 'lib', 'utils.js'),
+    join(repoRoot, 'node_modules', 'node-pty', 'lib', 'utils.js'),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  throw new Error('[bundle] Cannot find node-pty/lib/utils.js — run `npm ci` in worker/');
+})();
+console.log(`[bundle] shim target: ${nodePtyUtilsPath}`);
+console.log(`[bundle] shim source: ${shimPath}`);
+
+const nodePtyShimPlugin = {
+  name: 'node-pty-shim',
+  setup(build) {
+    build.onResolve({ filter: /.*/ }, (args) => {
+      // Only swap the exact utils.js inside node-pty/lib. Use endsWith to
+      // match regardless of whether the importer path is absolute or via
+      // a workspace symlink.
+      if (args.path === './utils' || args.path === './utils.js') {
+        // Importer resolves it under node-pty/lib/. We trust esbuild's resolver
+        // by NOT intercepting here — instead, intercept the final resolution:
+      }
+      return null;
+    });
+    build.onLoad({ filter: /node-pty[/\\]lib[/\\]utils\.js$/ }, async (args) => {
+      void args;
+      return {
+        contents: readFileSync(shimPath, 'utf-8'),
+        loader: 'js',
+      };
+    });
+  },
+};
 
 await esbuild.build({
   entryPoints: [cliEntry],
@@ -67,6 +114,7 @@ await esbuild.build({
     // Injected into cli/src/main.ts
     __ANYAGENT_VERSION__: JSON.stringify(version),
   },
+  plugins: [nodePtyShimPlugin],
   // SEA wants a single file — don't split
   splitting: false,
   // Slight win: strip legal comments (license text) from transitive deps
