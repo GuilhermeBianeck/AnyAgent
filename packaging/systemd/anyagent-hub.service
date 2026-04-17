@@ -1,0 +1,33 @@
+[Unit]
+Description=AnyAgent Hub (MCP bridge + WebSocket gateway)
+Documentation=https://github.com/GuilhermeBianeck/AnyAgent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# @USER@ / @GROUP@ / @WORKDIR@ / @NODE@ placeholders are replaced by packaging/install-service.sh
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@WORKDIR@/hub
+EnvironmentFile=@WORKDIR@/hub/.env
+ExecStart=@NODE@ @WORKDIR@/hub/dist/index.js
+Restart=always
+RestartSec=5
+# Give the hub up to 30s to shut down cleanly (draining tasks)
+TimeoutStopSec=30
+# File-descriptor headroom for many worker WebSockets
+LimitNOFILE=65536
+# Harden — the hub only needs to read/write its own data dir and bind its ports
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@WORKDIR@/hub/data @WORKDIR@/hub/logs
+PrivateTmp=true
+# Logs go to the service journal; `journalctl -u anyagent-hub -f` to tail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=anyagent-hub
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,109 @@
+# Build AnyAgent SEA binaries for all supported platforms and publish to a
+# GitHub Release whenever a tag like `v1.2.3` is pushed.
+#
+# Each platform builds on its own native runner (SEA cannot cross-compile —
+# the blob is injected into that OS's `node` binary). We produce:
+#
+#   anyagent-darwin-arm64
+#   anyagent-darwin-x64
+#   anyagent-linux-x64
+#   anyagent-linux-arm64
+#
+# …plus a .sha256 sidecar for each so the installer can verify integrity.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # create/update GitHub Releases
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14         # Apple Silicon runner
+            triple: darwin-arm64
+          - os: macos-13         # Intel runner (still maintained for cross-arch)
+            triple: darwin-x64
+          - os: ubuntu-24.04
+            triple: linux-x64
+          - os: ubuntu-24.04-arm # GitHub-hosted arm64 Linux runner
+            triple: linux-arm64
+
+    runs-on: ${{ matrix.os }}
+    name: build ${{ matrix.triple }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: |
+            hub/package-lock.json
+            cli/package-lock.json
+
+      - name: Install hub + cli deps
+        run: |
+          (cd hub && npm ci)
+          (cd cli && npm ci)
+
+      - name: Build SEA binary
+        run: ./packaging/sea/build.sh
+
+      - name: Compute checksum
+        shell: bash
+        run: |
+          cd dist
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "anyagent-${{ matrix.triple }}" > "anyagent-${{ matrix.triple }}.sha256"
+          else
+            sha256sum "anyagent-${{ matrix.triple }}" > "anyagent-${{ matrix.triple }}.sha256"
+          fi
+          ls -la
+
+      - name: Upload artifact (for workflow_dispatch testing)
+        uses: actions/upload-artifact@v4
+        with:
+          name: anyagent-${{ matrix.triple }}
+          path: |
+            dist/anyagent-${{ matrix.triple }}
+            dist/anyagent-${{ matrix.triple }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    name: publish release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release + upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/anyagent-darwin-arm64
+            dist/anyagent-darwin-arm64.sha256
+            dist/anyagent-darwin-x64
+            dist/anyagent-darwin-x64.sha256
+            dist/anyagent-linux-x64
+            dist/anyagent-linux-x64.sha256
+            dist/anyagent-linux-arm64
+            dist/anyagent-linux-arm64.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

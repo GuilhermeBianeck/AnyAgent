@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Placeholders @WORKDIR@ and @NODE@ replaced by packaging/install-service.sh.
+     Install path: ~/Library/LaunchAgents/com.anyagent.hub.plist
+     Load with:   launchctl load ~/Library/LaunchAgents/com.anyagent.hub.plist
+     Tail logs:   tail -f @WORKDIR@/hub/logs/hub.out.log @WORKDIR@/hub/logs/hub.err.log -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anyagent.hub</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@NODE@</string>
+        <string>@WORKDIR@/hub/dist/index.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@WORKDIR@/hub</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- dotenv/config inside the hub reads hub/.env, so we don't need to repeat vars here.
+             PATH is still useful because launchd starts with a minimal PATH. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>@WORKDIR@/hub/logs/hub.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@WORKDIR@/hub/logs/hub.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

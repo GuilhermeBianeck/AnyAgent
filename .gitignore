@@ -7,3 +7,5 @@ dist/
 *.db-wal
 *.db-shm
 data/
+logs/
+packaging/sea/build/

@@ -26,6 +26,8 @@ import {
   getTask,
 } from './db.js';
 import { escapeHtml } from './format.js';
+import { emit as emitEvent } from './events.js';
+import { incReconnect, incAuthFailure, setWorkersOnline } from './metrics.js';
 import type {
   JsonRpcRequest,
   JsonRpcResponse,
@@ -49,6 +51,20 @@ interface WorkerSession {
   challenge?: string;
   heartbeatTimer?: ReturnType<typeof setInterval>;
   pongReceived?: boolean;
+  remoteAddress?: string;
+}
+
+// ::1, 127.0.0.1, plain "localhost" routed to loopback — and the IPv4-mapped IPv6
+// form that Node emits on some platforms (::ffff:127.0.0.1).
+function isLoopbackAddr(addr: string | undefined): boolean {
+  if (!addr) return false;
+  return (
+    addr === '::1' ||
+    addr === '127.0.0.1' ||
+    addr === '::ffff:127.0.0.1' ||
+    addr.startsWith('127.') ||
+    addr === 'localhost'
+  );
 }
 
 type TtyCallback = (nodeId: string, data: Buffer) => void;
@@ -56,6 +72,7 @@ type StructuredOutputCallback = (nodeId: string, params: OutputParams) => void;
 type SessionEndCallback = (nodeId: string, exitCode: number) => void;
 type AgentChangeCallback = () => void;
 type PairingRequestCallback = (connId: string, workerName: string, workerDesc: string) => void;
+type WorkerOnlineCallback = (nodeId: string) => void;
 
 const sessions = new Map<string, WorkerSession>();
 const nodeMap = new Map<string, string>();
@@ -66,6 +83,7 @@ const structuredOutputCallbacks: StructuredOutputCallback[] = [];
 const sessionEndCallbacks: SessionEndCallback[] = [];
 const agentChangeCallbacks: AgentChangeCallback[] = [];
 const pairingRequestCallbacks: PairingRequestCallback[] = [];
+const workerOnlineCallbacks: WorkerOnlineCallback[] = [];
 
 function sendJson(ws: WebSocket, obj: JsonRpcResponse | JsonRpcRequest): void {
   ws.send(JSON.stringify(obj));
@@ -83,7 +101,12 @@ function makeError(id: string | number | undefined, code: number, message: strin
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = (() => {
+  const raw = parseInt(process.env.HEARTBEAT_INTERVAL_MS ?? '', 10);
+  // Clamp to [5s, 5min] — anything outside is almost certainly a mistake
+  if (Number.isFinite(raw) && raw >= 5_000 && raw <= 300_000) return raw;
+  return 30_000;
+})();
 
 function startHeartbeat(session: WorkerSession): void {
   if (session.heartbeatTimer) return;
@@ -91,12 +114,20 @@ function startHeartbeat(session: WorkerSession): void {
   session.heartbeatTimer = setInterval(() => {
     if (!session.pongReceived) {
       console.log(`[gateway] No pong from ${session.nodeId ?? session.wsId}, terminating`);
+      emitEvent('worker.heartbeat_miss', { node_id: session.nodeId });
       session.ws.terminate();
       return;
     }
     session.pongReceived = false;
     session.ws.ping();
   }, HEARTBEAT_INTERVAL_MS);
+}
+
+function refreshWorkerCount(): void {
+  // Single source of truth for "workers currently authenticated"
+  let online = 0;
+  for (const s of sessions.values()) if (s.authenticated) online++;
+  setWorkersOnline(online);
 }
 
 export function isNodeOnline(nodeId: string): boolean {
@@ -179,6 +210,10 @@ export function onPairingRequest(callback: PairingRequestCallback): void {
   pairingRequestCallbacks.push(callback);
 }
 
+export function onWorkerOnline(callback: WorkerOnlineCallback): void {
+  workerOnlineCallbacks.push(callback);
+}
+
 export function createGateway(
   port: number,
   bot: Bot | null,
@@ -204,7 +239,12 @@ export function createGateway(
     }
 
     const connId = randomBytes(8).toString('hex');
-    const session: WorkerSession = { ws, wsId: connId, authenticated: false };
+    const session: WorkerSession = {
+      ws,
+      wsId: connId,
+      authenticated: false,
+      remoteAddress: req.socket.remoteAddress,
+    };
     sessions.set(connId, session);
 
     // Pong handler for heartbeat
@@ -240,6 +280,11 @@ export function createGateway(
 
         // Remove from node map immediately so isNodeOnline returns false
         nodeMap.delete(disconnectedNodeId);
+        if (session.authenticated) {
+          const n = getNodeById(disconnectedNodeId);
+          emitEvent('worker.offline', { node_id: disconnectedNodeId, name: n?.name });
+        }
+        refreshWorkerCount();
         for (const cb of agentChangeCallbacks) cb();
 
         if (active) {
@@ -331,6 +376,22 @@ async function handleMessage(
         description: params.description,
       });
       deletePairCode(params.code);
+
+      // Auto-approve mode: when AUTO_APPROVE_LOOPBACK=1 and the worker is connecting
+      // from the same host, skip the human approval step. Used by quickstart.sh.
+      // The loopback check is a hard gate — this flag cannot trigger auto-approve
+      // for anything coming over the LAN, WAN, or through a reverse proxy (which
+      // would show a non-loopback X-Forwarded-For upstream anyway).
+      const autoApprove = process.env.AUTO_APPROVE_LOOPBACK === '1' && isLoopbackAddr(session.remoteAddress);
+      if (autoApprove) {
+        console.log(`[gateway] Auto-approving loopback pairing for ${params.name ?? connId.slice(0, 8)}`);
+        const nodeId = approvePair(connId);
+        if (!nodeId) {
+          sendJson(session.ws, makeError(req.id, -32002, 'Auto-approve failed'));
+        }
+        break;
+      }
+
       // Notify management interface(s) about the pairing request
       if (pairingRequestCallbacks.length > 0) {
         for (const cb of pairingRequestCallbacks) cb(connId, params.name ?? '', params.description ?? '');
@@ -408,8 +469,16 @@ async function handleMessage(
         nodeMap.set(params.nodeId, connId);
         startHeartbeat(session);
         sendJson(session.ws, makeResult(req.id, { success: true }));
+        emitEvent('worker.online', { node_id: params.nodeId, name: node.name });
+        incReconnect();
+        refreshWorkerCount();
+        for (const cb of workerOnlineCallbacks) {
+          try { cb(params.nodeId); } catch { /* isolate */ }
+        }
       } catch (err) {
         console.error('[gateway] Signature verification failed for node', params.nodeId);
+        incAuthFailure();
+        emitEvent('worker.auth_fail', { node_id: params.nodeId });
         sendJson(session.ws, makeError(req.id, -32005, 'Verification failed'));
       }
       break;
@@ -540,6 +609,11 @@ export function approvePair(connId: string): string | null {
     nodeMap.set(nodeId, connId);
     startHeartbeat(session);
     sendJson(session.ws, makeRpc('pair_result', { nodeId, success: true }));
+    emitEvent('worker.online', { node_id: nodeId, name: pending.name, detail: 'paired' });
+    refreshWorkerCount();
+    for (const cb of workerOnlineCallbacks) {
+      try { cb(nodeId); } catch { /* isolate */ }
+    }
   }
   return nodeId;
 }

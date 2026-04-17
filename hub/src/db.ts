@@ -1,14 +1,53 @@
-import Database from 'better-sqlite3';
+// Uses Node's built-in node:sqlite (stable since Node 22.5). No native module,
+// no node-gyp, no Python/compiler prereqs — the #1 source of install failures
+// for AnyAgent users was better-sqlite3's native build.
+//
+// Runtime API (prepare/run/get/all/exec) is a drop-in match. The one thing that
+// differs is TypeScript: node:sqlite's `.all()` returns Record<string, SQLOutputValue>[]
+// rather than `unknown[]`, and `.run().changes` is `number | bigint`. The `prep()`
+// helper below re-narrows both to the shapes our call sites were already using.
+import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import type { NodeRow, PairCodeRow, AgentRow, SessionRow, DefaultAgentRow, TaskRow, TaskStatus, TaskSource, RoutingMethod } from './types.js';
+import { incTask } from './metrics.js';
+import { emit as emitEvent } from './events.js';
+import { dataDir as resolveDataDir } from './paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dataDir = join(__dirname, '..', 'data');
-mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+const resolvedDataDir = resolveDataDir();
+mkdirSync(resolvedDataDir, { recursive: true, mode: 0o700 });
 
-const db = new Database(join(dataDir, 'anyagent.db'));
+const rawDb = new DatabaseSync(join(resolvedDataDir, 'anyagent.db'));
+
+// Thin adapter — isomorphic to the API every call site in this file already uses.
+// Centralizing the `as unknown` casts + BigInt→number narrowing here keeps the
+// rest of the file readable.
+interface PreparedStmt {
+  run(...args: unknown[]): { changes: number };
+  get<T>(...args: unknown[]): T | undefined;
+  all<T>(...args: unknown[]): T[];
+}
+const db = {
+  exec(sql: string): void { rawDb.exec(sql); },
+  prepare(sql: string): PreparedStmt {
+    const stmt = rawDb.prepare(sql);
+    return {
+      run(...args: unknown[]) {
+        // node:sqlite accepts null|number|bigint|string|Uint8Array for binds; all
+        // our call sites pass those, so the cast is sound.
+        const r = stmt.run(...(args as (null | number | bigint | string | Uint8Array)[]));
+        return { changes: Number(r.changes) };
+      },
+      get<T>(...args: unknown[]): T | undefined {
+        const row = stmt.get(...(args as (null | number | bigint | string | Uint8Array)[]));
+        return (row ?? undefined) as T | undefined;
+      },
+      all<T>(...args: unknown[]): T[] {
+        return stmt.all(...(args as (null | number | bigint | string | Uint8Array)[])) as unknown as T[];
+      },
+    };
+  },
+};
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS nodes (
@@ -217,6 +256,8 @@ export function getTask(taskId: string): TaskRow | undefined {
   return db.prepare(`SELECT * FROM tasks WHERE task_id = ?`).get(taskId) as TaskRow | undefined;
 }
 
+const TERMINAL_STATUSES: TaskStatus[] = ['complete', 'failed', 'timeout'];
+
 export function updateTaskStatus(taskId: string, status: TaskStatus, extra?: { agent_name?: string; node_id?: string; routing_method?: RoutingMethod; result_summary?: string; error?: string }): void {
   const sets = [`status = ?`, `updated_at = datetime('now')`];
   const values: unknown[] = [status];
@@ -227,6 +268,18 @@ export function updateTaskStatus(taskId: string, status: TaskStatus, extra?: { a
   if (extra?.error !== undefined) { sets.push('error = ?'); values.push(extra.error); }
   values.push(taskId);
   db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE task_id = ?`).run(...values);
+
+  // Emit terminal-state metrics + event log once per task
+  if (TERMINAL_STATUSES.includes(status)) {
+    const row = db.prepare(`SELECT source FROM tasks WHERE task_id = ?`).get(taskId) as { source?: string } | undefined;
+    const source = row?.source ?? 'unknown';
+    incTask(status, source);
+    if (status === 'complete') {
+      emitEvent('task.complete', { task_id: taskId });
+    } else {
+      emitEvent('task.failed', { task_id: taskId, detail: extra?.error });
+    }
+  }
 }
 
 export function getRecentTasks(limit: number = 10): TaskRow[] {
@@ -253,11 +306,13 @@ export function cleanOldTasks(daysToKeep: number = 30): void {
   db.prepare(`DELETE FROM tasks WHERE created_at < datetime('now', '-' || ? || ' days')`).run(daysToKeep);
 }
 
-// Startup cleanup: mark orphaned running/queued/routed tasks as failed
+// Startup cleanup: mark orphaned running/routed/pending_approval tasks as failed.
+// IMPORTANT: queued tasks are intentionally preserved — index.ts re-offers them to
+// workers via onWorkerOnline, so a hub restart doesn't lose queued work.
 export function failStaleTasks(): number {
   const result = db.prepare(
     `UPDATE tasks SET status = 'failed', error = 'Hub restarted', updated_at = datetime('now')
-     WHERE status IN ('running', 'queued', 'routed', 'pending_approval')`
+     WHERE status IN ('running', 'routed', 'pending_approval')`
   ).run();
   return result.changes;
 }

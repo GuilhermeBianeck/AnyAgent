@@ -2,22 +2,23 @@
   "name": "anyagent-hub",
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "start": "node --no-warnings=ExperimentalWarning dist/index.js",
+    "dev": "tsx --no-warnings=ExperimentalWarning src/index.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^12.6.2",
     "dotenv": "^16.4.5",
     "grammy": "^1.21.1",
     "ws": "^8.16.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^20.11.5",
+    "@types/node": "^22.0.0",
     "@types/node-fetch": "^2.6.13",
     "@types/ws": "^8.5.10",
     "tsx": "^4.7.0",

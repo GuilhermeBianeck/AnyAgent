@@ -1,0 +1,30 @@
+{
+  "name": "anyagent-cli",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "description": "Unified CLI entry that compiles to a single SEA binary.",
+  "scripts": {
+    "typecheck": "tsc",
+    "bundle": "node bundle.mjs",
+    "build": "npm run typecheck && npm run bundle",
+    "dev": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^16.4.5",
+    "grammy": "^1.21.1",
+    "ws": "^8.16.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

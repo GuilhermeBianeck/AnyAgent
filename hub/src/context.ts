@@ -1,10 +1,9 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { getRecentCompletedTasksByChatId } from './db.js';
+import { dataDir } from './paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONTEXT_PATH = join(__dirname, '..', 'data', 'context.md');
+const CONTEXT_PATH = join(dataDir(), 'context.md');
 
 export function getContext(): string {
   if (!existsSync(CONTEXT_PATH)) return '';

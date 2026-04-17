@@ -43,44 +43,100 @@ Run agents on your machines — Claude Code, local LLMs, shell scripts, anything
 
 ## Prerequisites
 
-- **Node.js 18+** — `node -v` to check
-- **Build tools** — needed for native modules (better-sqlite3, node-pty):
+- **Node.js 22+** on the hub machine — the hub uses the built-in `node:sqlite` module, which is stable since Node 22.5. Install via `brew install node@22`, `nvm install 22`, or NodeSource.
+- **Node.js 20+** on worker machines — the worker still uses `node-pty` for interactive CLI spawning; 20 LTS or newer works.
+- **Build tools** — only needed if `node-pty`'s prebuilt binary isn't available for your Node version on your platform. On most Linux/macOS boxes the install skips the compile step entirely.
   - macOS: `xcode-select --install`
   - Ubuntu/Debian: `sudo apt install python3 build-essential`
   - Alpine (Docker): `apk add python3 build-base`
 
 ## Quick Start
 
-### 1. Set up the hub
+### Option 0 — One-line install (no git, no npm, no Node)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GuilhermeBianeck/AnyAgent/main/packaging/sea/install.sh | bash
+anyagent quickstart
+```
+
+Installs a ~110MB single-file binary at `~/.local/bin/anyagent`. Runs the hub, writes the MCP entry into your Claude Code / Cursor config, prints the one-liner to add a worker. The binary embeds Node 22 — the target machine needs nothing else.
+
+For the worker side on the same machine:
+
+```bash
+npm i -g @anyagent/worker
+anyagent-worker --hub ws://127.0.0.1:8080 --pair "$(anyagent pair)"
+```
+
+(Worker still needs npm because `node-pty` is native; hub alone is zero-install.)
+
+Other binary commands:
+
+```bash
+anyagent hub             # start the hub (uses ./env or $ANYAGENT_HUB_DIR)
+anyagent pair            # print a fresh pair code
+anyagent wire-mcp ...    # inject the anyagent entry into an MCP config
+anyagent doctor PATH     # validate a worker .env
+anyagent --help
+```
+
+### Option A — git clone + quickstart (~60 seconds)
+
+If you already have an AI CLI installed (`claude`, `codex`, `ollama`, `aider`, or `gemini`) and you prefer a source install:
 
 ```bash
 git clone https://github.com/GuilhermeBianeck/AnyAgent.git
 cd AnyAgent
-./setup.sh    # asks 2 questions, generates all secrets
+./quickstart.sh
+```
+
+That script:
+
+1. Detects an AI CLI on your PATH
+2. Builds hub + worker
+3. Starts both in the background
+4. Auto-pairs over loopback (no code dance)
+5. Writes the MCP entry into your Claude Code / Cursor config
+
+When it's done, reopen your MCP client. Your CLI is now callable as `anyagent_<name>`.
+
+```bash
+./quickstart.sh --stop                    # halt the background processes
+./packaging/install-service.sh hub         # promote to systemd / launchd
+./packaging/install-service.sh worker
+```
+
+### Option B — Multi-machine setup
+
+For a hub on one machine and workers on others:
+
+```bash
+# Machine A (hub):
+git clone https://github.com/GuilhermeBianeck/AnyAgent.git
+cd AnyAgent && ./setup.sh       # 2 questions, Telegram optional
 cd hub && npm start
+
+# Machine B (worker) — first run only:
+# In the hub CLI, type: pair (or /pair in Telegram)
+# Copy the code, then on machine B:
+git clone https://github.com/GuilhermeBianeck/AnyAgent.git
+cd AnyAgent && ./add-worker.sh   # auto-detects installed CLIs
 ```
 
-> Hub starts with a CLI prompt. Telegram is optional — set `BOT_TOKEN` to enable.
+Approve the pairing (`y` in the hub CLI, or tap Approve in Telegram).
 
-### 2. Add a worker
+Pass `--install-service` to either script to install a systemd/launchd unit at the end.
 
-On each machine you want to connect:
+Then wire up your MCP client:
 
 ```bash
-# In the hub CLI, type: pair (or send /pair in Telegram)
-# Copy the pairing code, then on the worker machine:
-
-git clone https://github.com/GuilhermeBianeck/AnyAgent.git
-cd AnyAgent
-./add-worker.sh
-cd worker && npm start
+# From the hub checkout, inject into ~/.claude.json (backup saved automatically):
+node hub/dist/tools/wire-mcp.js \
+  --url http://HUB_IP:3000 \
+  --token "$(grep MCP_TOKEN hub/.env | cut -d= -f2)"
 ```
 
-Approve the pairing (`y` in CLI, or tap Approve in Telegram). Done — credentials auto-save for future restarts.
-
-### 3. Connect MCP clients
-
-Add to your Claude Code / Cursor `.mcp.json`:
+Or add manually to Claude Code / Cursor's `.mcp.json`:
 
 ```json
 {
@@ -93,15 +149,26 @@ Add to your Claude Code / Cursor `.mcp.json`:
 }
 ```
 
-Your agents appear as MCP tools automatically. Try: *"Use anyagent_route to fix the bug in auth.ts"*
+Try: *"Use anyagent_route to fix the bug in auth.ts"*
 
-### Docker alternative
+### Option C — Docker
 
 ```bash
 cp .env.hub.example .env.hub       # edit with your tokens
 cp .env.worker.example .env.worker
 docker compose up -d
 ```
+
+### Keeping it online
+
+Neither `quickstart.sh` nor `npm start` survive a reboot. For production:
+
+```bash
+./packaging/install-service.sh hub      # systemd (Linux) / launchd (macOS)
+./packaging/install-service.sh worker
+```
+
+Full operations guide: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ---
 
@@ -269,7 +336,11 @@ cd worker && npm run dev
 
 | | |
 |---|---|
+| [Operations](docs/OPERATIONS.md) | systemd/launchd install, health endpoints, backup, upgrades |
+| [Networking](docs/NETWORKING.md) | LAN / Tailscale / reverse-proxy / air-gapped patterns |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | 15 anchored fixes for common setup failures |
 | [Privacy Model](docs/PRIVACY.md) | What Telegram sees, what stays local, retention policy |
+| [Reliability Plan](docs/RELIABILITY-PLAN.md) | What improvements shipped and what's next |
 | [Roadmap](docs/ROADMAP.md) | 6-phase plan from npm publish to community building |
 | [Market Comparison](docs/MARKET-COMPARISON.md) | AnyAgent vs Manus, OpenClaw, AgentGateway, Claude Channels |
 | [Product Requirements](docs/PRD-v2-agent-control-plane.md) | Goals, requirements, acceptance criteria |

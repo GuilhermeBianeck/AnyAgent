@@ -11,6 +11,8 @@ import {
 import { getContext } from './context.js';
 import type { TaskRow } from './types.js';
 import { insertTask, updateTaskStatus } from './db.js';
+import { getBuildInfo, uptimeSeconds } from './build-info.js';
+import { metricsEnabled, renderMetrics, setWorkersOnline } from './metrics.js';
 
 type McpTaskCallback = (task: TaskRow) => void;
 let onMcpTaskCallback: McpTaskCallback | null = null;
@@ -165,6 +167,54 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
   const expectedToken = Buffer.from(`Bearer ${mcpToken}`);
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // ---- Unauthenticated liveness / readiness / metrics endpoints ----
+    // Deliberately before the Bearer gate so orchestrators can probe without
+    // needing the MCP token.
+    const url = req.url ?? '/';
+    const method = req.method ?? 'GET';
+
+    if (method === 'GET' && (url === '/health' || url.startsWith('/health?'))) {
+      const workers = getWorkerList();
+      const onlineCount = workers.filter(w => w.online).length;
+      setWorkersOnline(onlineCount);
+      const info = getBuildInfo();
+      const body = {
+        ok: true,
+        version: info.version,
+        node: info.node,
+        uptime_s: uptimeSeconds(),
+        workers: { total: workers.length, online: onlineCount },
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+      return;
+    }
+
+    if (method === 'GET' && (url === '/ready' || url.startsWith('/ready?'))) {
+      // Ready = at least one worker online, OR READY_ALLOW_EMPTY=1 for bootstrap.
+      const workers = getWorkerList();
+      const onlineCount = workers.filter(w => w.online).length;
+      const allowEmpty = process.env.READY_ALLOW_EMPTY === '1';
+      const ready = onlineCount > 0 || allowEmpty;
+      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ready, workers_online: onlineCount }));
+      return;
+    }
+
+    if (method === 'GET' && url === '/metrics') {
+      if (!metricsEnabled()) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('metrics disabled (set ENABLE_METRICS=1)\n');
+        return;
+      }
+      const workers = getWorkerList();
+      setWorkersOnline(workers.filter(w => w.online).length);
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+      res.end(renderMetrics());
+      return;
+    }
+
+    // ---- MCP JSON-RPC endpoint — Bearer required ----
     const authHeader = req.headers.authorization ?? '';
     const authBuf = Buffer.from(authHeader);
     const valid = authBuf.length === expectedToken.length && timingSafeEqual(authBuf, expectedToken);

@@ -1,10 +1,18 @@
+import { initLogger } from './logger.js';
+import { initNetlog } from './netlog.js';
 import 'dotenv/config';
+// Order matters: dotenv loads .env, then logger + netlog read env flags.
+initLogger();
+initNetlog();
 import { createBot } from './bot.js';
-import { createGateway } from './gateway.js';
+import { createGateway, onWorkerOnline } from './gateway.js';
 import { createMcpServer, onMcpTask } from './mcp.js';
 import { startCli } from './cli.js';
 import { failStaleTasks, clearAllSessions, cleanOldTasks } from './db.js';
 import { escapeHtml } from './format.js';
+import { emit as emitEvent } from './events.js';
+import { processNextQueued } from './manager.js';
+import { getBuildInfo } from './build-info.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
@@ -16,15 +24,44 @@ const MCP_TOKEN = process.env.MCP_TOKEN;
 if (BOT_TOKEN && !ALLOWED_USER_ID) throw new Error('ALLOWED_USER_ID env var required when BOT_TOKEN is set');
 const allowedUserId = parseInt(ALLOWED_USER_ID ?? '0', 10);
 
-// Startup cleanup
+// Startup cleanup. NOTE: failStaleTasks only marks 'running'/'routed'/'pending_approval'
+// as failed — queued tasks are intentionally preserved so they can be re-offered to
+// workers when they reconnect (see onWorkerOnline below).
 const stale = failStaleTasks();
-if (stale > 0) console.log(`[hub] Marked ${stale} stale task(s) as failed`);
+if (stale > 0) console.log(`[hub] Marked ${stale} stale task(s) as failed (hub restart)`);
 clearAllSessions();
 cleanOldTasks(30);
+
+const buildInfo = getBuildInfo();
+console.log(`[hub] AnyAgent v${buildInfo.version} on ${buildInfo.node}`);
+emitEvent('hub.started', { detail: `v${buildInfo.version}` });
+
+// Graceful shutdown — let ongoing requests finish
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    console.log(`[hub] Received ${sig}, shutting down...`);
+    emitEvent('hub.stopped', { detail: sig });
+    setTimeout(() => process.exit(0), 500);
+  });
+}
 
 // WebSocket gateway (always starts)
 const bot = BOT_TOKEN ? createBot(BOT_TOKEN, allowedUserId, { wsPort: WS_PORT, wsSecret: WS_SECRET, mcpPort: MCP_PORT, mcpToken: MCP_TOKEN }) : null;
 createGateway(WS_PORT, bot, allowedUserId, WS_SECRET);
+
+// Re-offer any queued tasks whenever a worker comes online. This covers:
+//   - Hub was restarted and the worker reconnects with queued rows waiting
+//   - Worker briefly dropped, reconnected within the grace window
+// Loop until empty so a chain of queued tasks doesn't stall at 1-per-reconnect.
+onWorkerOnline((nodeId) => {
+  // processNextQueued spawns the next queued task and returns 'started' or 'empty'.
+  // If the worker becomes busy immediately after spawning one, that's fine —
+  // the next one will fire on the next 'session end' event.
+  const result = processNextQueued(nodeId);
+  if (result.outcome === 'started') {
+    console.log(`[hub] Worker ${nodeId} came back — dispatched queued task ${result.taskId}`);
+  }
+});
 
 // MCP server (if token set)
 if (MCP_TOKEN) {

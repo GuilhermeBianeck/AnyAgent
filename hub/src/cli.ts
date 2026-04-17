@@ -15,9 +15,14 @@ import {
 } from './manager.js';
 import { getAgentByName, insertTask, updateTaskStatus } from './db.js';
 import { getContext, setContext, appendContext, clearContext } from './context.js';
-import { onTtyOutput, onStructuredOutput, onSessionEnd, onPairingRequest } from './gateway.js';
+import { onTtyOutput, onStructuredOutput, onSessionEnd, onPairingRequest, onWorkerOnline } from './gateway.js';
 import { stripAnsi } from './output.js';
 import type { OutputParams, TaskStatus } from './types.js';
+import { getBuildInfo, formatUptime, uptimeSeconds } from './build-info.js';
+import { recentEventsList, onEvent, eventsLogPath } from './events.js';
+import { metricsEnabled } from './metrics.js';
+import { recentConnections, auditEnabled, airgapEnabled } from './netlog.js';
+import { logPath } from './logger.js';
 
 const BOLD = '\x1b[1m';
 const GREEN = '\x1b[32m';
@@ -48,6 +53,21 @@ function taskIcon(status: TaskStatus): string {
 
 export function startCli(): void {
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: `${DIM}anyagent>${RESET} ` });
+
+  // Live prompt status bar — shows (N↑ M↓) for online/offline workers
+  function refreshPrompt(): void {
+    const workers = getWorkerList();
+    const up = workers.filter(w => w.online).length;
+    const down = workers.length - up;
+    const bar = workers.length === 0
+      ? ''
+      : ` ${DIM}(${up > 0 ? GREEN : DIM}${up}↑${RESET}${DIM}${down > 0 ? ` ${RED}${down}↓${RESET}${DIM}` : ''})${RESET}`;
+    rl.setPrompt(`${DIM}anyagent${bar}>${RESET} `);
+  }
+  refreshPrompt();
+  // Refresh when a worker changes state. Don't re-draw the prompt while the user is
+  // mid-typing — only update the prompt template so the next redraw uses it.
+  onWorkerOnline(() => refreshPrompt());
 
   // --- Event handlers ---
 
@@ -151,7 +171,9 @@ ${BOLD}Config${RESET}
   context [set|add|clear] <text>  Manage operator context
   purge               Delete all task history
 
-  status              Show current status
+  status              Show version, uptime, workers, approval mode
+  events [watch]      Recent worker state transitions (watch tails live)
+  net                 Recent outbound connections (AUDIT_NETWORK=1)
   help                Show this help
   quit                Exit
 `);
@@ -318,12 +340,64 @@ ${BOLD}Config${RESET}
         const session = getActiveSessionByChatId(CLI_CHAT_ID);
         const def = getDefaultAgent(CLI_CHAT_ID);
         const mode = getApprovalMode(CLI_CHAT_ID);
+        const info = getBuildInfo();
+        const rss = Math.round(process.memoryUsage().rss / 1024 / 1024);
         console.log(`${BOLD}Status${RESET}`);
-        console.log(`  Workers: ${workers.filter(w => w.online).length}/${workers.length} online`);
-        console.log(`  Agents:  ${agents.length} registered`);
-        console.log(`  Active:  ${session?.agentName ?? 'none'}`);
-        console.log(`  Default: ${def ?? 'none'}`);
+        console.log(`  Version:  v${info.version} on ${info.node}`);
+        console.log(`  Uptime:   ${formatUptime(uptimeSeconds())}`);
+        console.log(`  Memory:   ${rss} MB RSS`);
+        console.log(`  Workers:  ${workers.filter(w => w.online).length}/${workers.length} online`);
+        console.log(`  Agents:   ${agents.length} registered`);
+        console.log(`  Active:   ${session?.agentName ?? 'none'}`);
+        console.log(`  Default:  ${def ?? 'none'}`);
         console.log(`  Approval: ${mode}`);
+        console.log(`  Metrics:  ${metricsEnabled() ? 'on' : 'off'}${airgapEnabled() ? ', airgap=on' : ''}${auditEnabled() ? ', audit=on' : ''}`);
+        console.log(`  Logs:     ${logPath()}`);
+        break;
+      }
+
+      case 'events': {
+        // events                 → show last 20 events
+        // events watch           → tail events live
+        if (argStr === 'watch') {
+          console.log(`${DIM}Tailing event log. Press Ctrl+C to stop.${RESET}`);
+          onEvent((evt) => {
+            const parts = [evt.t.slice(11, 19), evt.type];
+            if (evt.name) parts.push(evt.name);
+            if (evt.node_id) parts.push(DIM + evt.node_id + RESET);
+            if (evt.detail) parts.push(`— ${evt.detail}`);
+            console.log(parts.join(' '));
+          });
+          return; // don't re-prompt; user Ctrl+Cs
+        }
+        const events = recentEventsList(20);
+        if (events.length === 0) {
+          console.log('No events yet.');
+        } else {
+          console.log(`${BOLD}Recent events${RESET} ${DIM}(${eventsLogPath()})${RESET}`);
+          for (const e of events) {
+            const name = e.name ? ` ${e.name}` : '';
+            const detail = e.detail ? ` ${DIM}— ${e.detail}${RESET}` : '';
+            console.log(`  ${DIM}${e.t.slice(11, 19)}${RESET}  ${e.type}${name}${detail}`);
+          }
+        }
+        break;
+      }
+
+      case 'net': {
+        if (!auditEnabled()) {
+          console.log(`${DIM}Network audit is off. Start hub with AUDIT_NETWORK=1 to enable.${RESET}`);
+          break;
+        }
+        const conns = recentConnections(50);
+        if (conns.length === 0) {
+          console.log('No outbound connections recorded.');
+        } else {
+          console.log(`${BOLD}Recent outbound connections${RESET}`);
+          for (const c of conns) {
+            console.log(`  ${DIM}${c.t.slice(11, 19)}${RESET}  ${c.host}:${c.port}  ${DIM}${c.reason}${RESET}`);
+          }
+        }
         break;
       }
 

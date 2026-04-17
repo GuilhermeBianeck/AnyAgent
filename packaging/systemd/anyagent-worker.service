@@ -1,0 +1,27 @@
+[Unit]
+Description=AnyAgent Worker (exposes local CLIs as MCP agents)
+Documentation=https://github.com/GuilhermeBianeck/AnyAgent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@WORKDIR@/worker
+EnvironmentFile=@WORKDIR@/worker/.env
+ExecStart=@NODE@ @WORKDIR@/worker/dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+LimitNOFILE=65536
+# The worker's whole job is to spawn user binaries, so we do NOT ProtectSystem=strict.
+# We still drop privilege bits that aren't needed.
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=anyagent-worker
+
+[Install]
+WantedBy=multi-user.target

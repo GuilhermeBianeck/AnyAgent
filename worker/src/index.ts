@@ -42,6 +42,13 @@ if (WORKER_AGENTS_RAW) {
   }
 }
 
+// --doctor flag — self-check and exit
+if (process.argv.includes('--doctor')) {
+  const { runDoctor } = await import('./doctor.js');
+  const code = await runDoctor();
+  process.exit(code);
+}
+
 // Help flag
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   console.log(`
@@ -57,6 +64,7 @@ Options:
   --name <name>     Worker display name
   --desc <text>     Worker description
   --agents <json>   Agent declarations as JSON array
+  --doctor          Self-check: validate env, agents, hub DNS, and exit
   -h, --help        Show this help
 
 Environment variables (overridden by CLI args):
