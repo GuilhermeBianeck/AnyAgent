@@ -13,7 +13,7 @@ import {
   setDefaultAgent, getDefaultAgent, clearDefaultAgent,
   getApprovalMode, setApprovalMode, purgeTasksByChatId,
 } from './manager.js';
-import { getAgentByName, insertTask, updateTaskStatus } from './db.js';
+import { getAgentByName, getAgentByNameAndAlias, insertTask, updateTaskStatus } from './db.js';
 import { getContext, setContext, appendContext, clearContext } from './context.js';
 import { onTtyOutput, onStructuredOutput, onSessionEnd, onPairingRequest, onWorkerOnline } from './gateway.js';
 import { stripAnsi } from './output.js';
@@ -194,8 +194,9 @@ ${BOLD}Config${RESET}
         } else {
           console.log(`${BOLD}Workers:${RESET}`);
           for (const w of workers) {
+            const nameSuffix = w.name && w.name !== w.alias ? ` (${w.name})` : '';
             const desc = w.description ? ` — ${w.description}` : '';
-            console.log(`  ${statusIcon(w.online)} ${w.name}${desc} ${DIM}(${w.nodeId})${RESET}`);
+            console.log(`  ${statusIcon(w.online)} ${w.alias}${nameSuffix}${desc} ${DIM}(${w.nodeId})${RESET}`);
           }
         }
         break;
@@ -205,20 +206,50 @@ ${BOLD}Config${RESET}
         const agents = getAgentList();
         if (agents.length === 0) {
           console.log('No agents registered. Connect a worker to declare agents.');
-        } else {
-          console.log(`${BOLD}Agents:${RESET}`);
-          for (const a of agents) {
+          break;
+        }
+        // Group by node so the operator sees which machine owns each agent.
+        const byNode = new Map<string, { nodeName: string; online: boolean; items: typeof agents }>();
+        for (const a of agents) {
+          if (!byNode.has(a.nodeAlias)) {
+            byNode.set(a.nodeAlias, { nodeName: a.nodeName, online: a.online, items: [] });
+          }
+          const g = byNode.get(a.nodeAlias)!;
+          g.items.push(a);
+          if (a.online) g.online = true;
+        }
+        console.log(`${BOLD}Agents:${RESET}`);
+        const aliases = [...byNode.keys()].sort();
+        for (const alias of aliases) {
+          const g = byNode.get(alias)!;
+          const nameSuffix = g.nodeName && g.nodeName !== alias ? ` ${DIM}(${g.nodeName})${RESET}` : '';
+          console.log(`  ${statusIcon(g.online)} ${BOLD}${alias}${RESET}${nameSuffix}`);
+          for (const a of g.items) {
             const caps = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
-            console.log(`  ${statusIcon(a.online)} ${a.name} — ${a.description}${caps}`);
+            const desc = a.description ? ` — ${a.description}` : '';
+            console.log(`      ${statusIcon(a.online)} ${a.name}${desc}${caps}`);
           }
         }
+        console.log('');
+        console.log(`${DIM}Call short form:  call <name>${RESET}`);
+        console.log(`${DIM}Target a machine: call <name>@<alias>${RESET}`);
         break;
       }
 
       case 'call': {
-        if (!argStr) { console.log('Usage: call <agent_name>'); break; }
-        const agent = getAgentByName(argStr);
-        if (!agent) { console.log(`${RED}Agent "${argStr}" not found.${RESET}`); break; }
+        if (!argStr) { console.log('Usage: call <name> | call <name>@<alias>'); break; }
+        // Allow `call claude@spot` to target a specific machine when multiple
+        // nodes have an agent of the same name. Falls back to name-only lookup.
+        const atIdx = argStr.lastIndexOf('@');
+        const agentName = atIdx >= 0 ? argStr.slice(0, atIdx) : argStr;
+        const alias = atIdx >= 0 ? argStr.slice(atIdx + 1) : '';
+        const agent = alias
+          ? (getAgentByNameAndAlias(agentName, alias) ?? getAgentByName(agentName))
+          : getAgentByName(agentName);
+        if (!agent) {
+          console.log(`${RED}Agent "${argStr}" not found.${RESET}`);
+          break;
+        }
         const existing = getActiveSessionByChatId(CLI_CHAT_ID);
         if (existing) clearActiveSession(existing.nodeId);
         const taskId = createTaskId();

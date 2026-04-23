@@ -82,6 +82,7 @@ export interface NodeRow {
   public_key: string;
   name: string;
   description: string;
+  alias: string; // human-friendly short handle, derived from name on pair/rename (v2.1)
   approved: number; // 0 or 1
   created_at: string;
 }

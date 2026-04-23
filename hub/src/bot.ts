@@ -11,7 +11,7 @@ import {
 } from './manager.js';
 import { randomBytes } from 'crypto';
 import {
-  getAgentByName, insertTask, updateTaskStatus, getRunningTasksByNodeId,
+  getAgentByName, getAgentByNameAndAlias, insertTask, updateTaskStatus, getRunningTasksByNodeId,
   insertPairCode, getRecentTasksByChatId, getAllNodes, getAllAgents,
   setAgentTrusted,
 } from './db.js';
@@ -405,16 +405,19 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
   // --- /workers ---
   async function handleWorkers(ctx: Context): Promise<void> {
     if (!guardUser(ctx, allowedUserId)) return;
-    const nodes = getAllNodes();
-    if (nodes.length === 0) {
+    const workers = getWorkerList();
+    if (workers.length === 0) {
       await ctx.reply('No workers registered. Use /pair to add one.');
       return;
     }
-    const buttons = nodes.map((n) => {
-      const status = isNodeOnline(n.node_id) ? '🟢' : '🔴';
-      const label = n.name || n.node_id;
-      const desc = n.description ? ` — ${n.description}` : '';
-      return [{ text: `${status} ${label}${desc}`, callback_data: `worker:${n.node_id}` }];
+    const buttons = workers.map((w) => {
+      const status = w.online ? '🟢' : '🔴';
+      const label = w.alias || w.name;
+      // If the friendly name differs from the alias, show both so operators
+      // can recognise the machine either way.
+      const suffix = w.name && w.name !== w.alias ? ` (${w.name})` : '';
+      const desc = w.description ? ` — ${w.description}` : '';
+      return [{ text: `${status} ${label}${suffix}${desc}`, callback_data: `worker:${w.nodeId}` }];
     });
     await sendHtml(ctx, '<b>Workers:</b>', { reply_markup: { inline_keyboard: buttons } });
   }
@@ -422,22 +425,44 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
   bot.command('devices', handleWorkers);
   bot.command('list', handleWorkers);
 
-  // --- /agents ---
+  // --- /agents (grouped by machine) ---
   bot.command('agents', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    const agents = getAllAgents();
+    const agents = getAgentList();
     if (agents.length === 0) {
       await ctx.reply('No agents registered. Connect a worker with WORKER_AGENTS to declare agents.');
       return;
     }
-    const buttons = agents.map((a) => {
-      const online = isNodeOnline(a.node_id) ? '🟢' : '🔴';
-      const caps: string[] = JSON.parse(a.capabilities || '[]');
-      const capsStr = caps.length > 0 ? ` [${caps.join(', ')}]` : '';
-      const desc = a.description ? ` - ${a.description}` : '';
-      return [{ text: `${online} ${a.name}${desc}${capsStr}`, callback_data: `call:${a.name}` }];
-    });
-    await sendHtml(ctx, '<b>Agents:</b> (tap to start)', { reply_markup: { inline_keyboard: buttons } });
+    // Bucket agents by node alias so the operator can see, at a glance, which
+    // machine owns each agent instead of a flat list that collides on names.
+    const byNode = new Map<string, { nodeName: string; online: boolean; items: typeof agents }>();
+    for (const a of agents) {
+      if (!byNode.has(a.nodeAlias)) {
+        byNode.set(a.nodeAlias, { nodeName: a.nodeName, online: a.online, items: [] });
+      }
+      const g = byNode.get(a.nodeAlias)!;
+      g.items.push(a);
+      if (a.online) g.online = true;
+    }
+
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+    const aliases = [...byNode.keys()].sort();
+    const textParts: string[] = [];
+    for (const alias of aliases) {
+      const g = byNode.get(alias)!;
+      const nameSuffix = g.nodeName && g.nodeName !== alias ? ` (${escapeHtml(g.nodeName)})` : '';
+      textParts.push(`${g.online ? '🟢' : '🔴'} <b>${escapeHtml(alias)}</b>${nameSuffix}`);
+      for (const a of g.items) {
+        const capsStr = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
+        const desc = a.description ? ` — ${a.description}` : '';
+        // Label shows name@alias so the user always knows which machine they
+        // are targeting when they tap. callback_data carries both pieces to
+        // let future routing disambiguate explicitly (Phase 2 + 4).
+        const label = `${a.online ? '🟢' : '🔴'} ${a.name}@${alias}${desc}${capsStr}`;
+        buttons.push([{ text: label, callback_data: `call:${a.name}@${alias}` }]);
+      }
+    }
+    await sendHtml(ctx, `<b>Agents:</b> (tap to start)\n\n${textParts.join('\n')}`, { reply_markup: { inline_keyboard: buttons } });
   });
 
   // --- /tasks (P1-1 but useful now) ---
@@ -819,8 +844,16 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
   // --- Callback: call agent ---
   bot.callbackQuery(/^call:(.+)$/, async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
-    const agentName = ctx.match[1];
-    const agent = getAgentByName(agentName);
+    const token = ctx.match[1];
+    // Accept both `call:<name>` (pre-v2.1 buttons, short form) and
+    // `call:<name>@<alias>` (explicit — unambiguous when multiple nodes
+    // have an agent with the same name).
+    const atIdx = token.lastIndexOf('@');
+    const agentName = atIdx >= 0 ? token.slice(0, atIdx) : token;
+    const alias = atIdx >= 0 ? token.slice(atIdx + 1) : '';
+    const agent = alias
+      ? (getAgentByNameAndAlias(agentName, alias) ?? getAgentByName(agentName))
+      : getAgentByName(agentName);
     if (!agent) {
       await ctx.answerCallbackQuery({ text: 'Agent not found.' });
       return;
@@ -828,10 +861,11 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     const existing = getActiveSessionByChatId(ctx.chat!.id);
     if (existing) clearActiveSession(existing.nodeId);
 
-    await ctx.answerCallbackQuery({ text: `Starting ${agentName}...` });
+    const label = alias ? `${agentName}@${alias}` : agentName;
+    await ctx.answerCallbackQuery({ text: `Starting ${label}...` });
     const taskId = createTaskId();
-    insertTask(taskId, 'telegram', `call:${agentName}`, ctx.chat!.id);
-    { const _r = startAgentForTask(agent, taskId, `call:${agentName}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
+    insertTask(taskId, 'telegram', `call:${label}`, ctx.chat!.id);
+    { const _r = startAgentForTask(agent, taskId, `call:${label}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, _r, taskId); }
     updatePinnedStatus();
   });
 
@@ -863,6 +897,8 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     const nodes = getAllNodes();
     const node = nodes.find((n) => n.node_id === nodeId);
     const name = node?.name || nodeId;
+    // Prefer the short alias in buttons; falls back to the node's short id slice.
+    const alias = (node?.alias && node.alias.length > 0) ? node.alias : nodeId.replace(/^node_/, '').slice(0, 8);
     const desc = node?.description ? `\n${escapeHtml(node.description)}` : '';
 
     if (agents.length === 0) {
@@ -870,7 +906,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     } else {
       const buttons = agents.map((a) => {
         const agentDesc = a.description ? ` - ${a.description}` : '';
-        return [{ text: `▶️ ${a.name}${agentDesc}`, callback_data: `call:${a.name}` }];
+        return [{ text: `▶️ ${a.name}@${alias}${agentDesc}`, callback_data: `call:${a.name}@${alias}` }];
       });
       await ctx.editMessageText(`<b>${escapeHtml(name)}</b> ${online}${desc}`, {
         parse_mode: 'HTML',

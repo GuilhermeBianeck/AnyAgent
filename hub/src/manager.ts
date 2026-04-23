@@ -6,7 +6,8 @@
 
 import { randomBytes } from 'crypto';
 import {
-  getAllNodes, getAgentByName, getAllAgents,
+  getAllNodes, getNodeById, getAgentByName, getAllAgents,
+  nodeDisplayAlias,
   insertPairCode, insertTask, updateTaskStatus, getTask,
   getQueuedTasksByNodeId, getRecentTasksByChatId,
   purgeTasksByChatId, revokeNode as dbRevokeNode,
@@ -239,24 +240,44 @@ export function revokeWorker(nodeId: string): boolean {
   return dbRevokeNode(nodeId);
 }
 
-export function getWorkerList(): Array<{ nodeId: string; name: string; description: string; online: boolean }> {
+export function getWorkerList(): Array<{ nodeId: string; name: string; alias: string; description: string; online: boolean }> {
   return getAllNodes().map(n => ({
     nodeId: n.node_id,
     name: n.name || n.node_id,
+    alias: nodeDisplayAlias(n),
     description: n.description,
     online: isNodeOnline(n.node_id),
   }));
 }
 
-export function getAgentList(): Array<{ name: string; description: string; capabilities: string[]; nodeId: string; online: boolean; contextAware: boolean }> {
-  return getAllAgents().map(a => ({
-    name: a.name,
-    description: a.description,
-    capabilities: JSON.parse(a.capabilities || '[]'),
-    nodeId: a.node_id,
-    online: isNodeOnline(a.node_id),
-    contextAware: a.context_aware !== 0,
-  }));
+export function getAgentList(): Array<{ name: string; description: string; capabilities: string[]; nodeId: string; nodeAlias: string; nodeName: string; online: boolean; contextAware: boolean }> {
+  // Pre-load nodes into a map so we don't N+1 across agent rows.
+  const nodesByIdMap = new Map<string, { alias: string; name: string }>();
+  for (const n of getAllNodes()) {
+    nodesByIdMap.set(n.node_id, { alias: nodeDisplayAlias(n), name: n.name || n.node_id });
+  }
+  return getAllAgents().map(a => {
+    const n = nodesByIdMap.get(a.node_id);
+    // Fallback if the node row was somehow deleted but the agent wasn't — use a
+    // single DB call rather than silently drop the agent from the UI.
+    let alias = n?.alias;
+    let nodeName = n?.name;
+    if (alias === undefined) {
+      const row = getNodeById(a.node_id);
+      alias = row ? nodeDisplayAlias(row) : a.node_id.replace(/^node_/, '').slice(0, 8);
+      nodeName = row?.name || a.node_id;
+    }
+    return {
+      name: a.name,
+      description: a.description,
+      capabilities: JSON.parse(a.capabilities || '[]'),
+      nodeId: a.node_id,
+      nodeAlias: alias,
+      nodeName: nodeName ?? a.node_id,
+      online: isNodeOnline(a.node_id),
+      contextAware: a.context_aware !== 0,
+    };
+  });
 }
 
 // --- Session ---

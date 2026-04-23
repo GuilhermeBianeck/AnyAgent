@@ -82,15 +82,45 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
 function registerStaticTools(server: McpServer): void {
   server.tool(
     'anyagent_list_agents',
-    'List all registered agents with their capabilities and online/offline status',
+    'List all registered agents grouped by machine, with online/offline status.',
     {},
     async () => {
       const agents = getAgentList();
-      const list = agents.map(a => {
-        const caps = a.capabilities.length > 0 ? a.capabilities.join(', ') : 'no capabilities';
-        return `${a.online ? '🟢' : '🔴'} ${a.name} — ${a.description || 'no description'} [${caps}]`;
-      });
-      return { content: [{ type: 'text' as const, text: list.length > 0 ? list.join('\n') : 'No agents registered.' }] };
+      if (agents.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No agents registered.' }] };
+      }
+
+      // Group by nodeAlias so the user can see which agents live on which machine.
+      const byNode = new Map<string, { nodeName: string; online: boolean; items: typeof agents }>();
+      for (const a of agents) {
+        const key = a.nodeAlias;
+        if (!byNode.has(key)) {
+          byNode.set(key, { nodeName: a.nodeName, online: a.online, items: [] });
+        }
+        const group = byNode.get(key)!;
+        group.items.push(a);
+        // A node is "online" in the header if ANY of its agents are online,
+        // which today is equivalent to the worker being connected.
+        if (a.online) group.online = true;
+      }
+
+      const lines: string[] = [];
+      // Sort nodes alphabetically by alias for stable output
+      const sortedAliases = [...byNode.keys()].sort();
+      for (const alias of sortedAliases) {
+        const group = byNode.get(alias)!;
+        const header = `${group.online ? '🟢' : '🔴'} ${alias}${group.nodeName && group.nodeName !== alias ? ` (${group.nodeName})` : ''}`;
+        lines.push(header);
+        for (const a of group.items) {
+          const caps = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
+          const desc = a.description ? ` — ${a.description}` : '';
+          lines.push(`   ${a.online ? '🟢' : '🔴'} ${a.name}${desc}${caps}`);
+        }
+      }
+      lines.push('');
+      lines.push('Call short form (hub picks the node):  anyagent_<name>');
+      lines.push('Call a specific machine:               anyagent_<name>_<alias>');
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     }
   );
 

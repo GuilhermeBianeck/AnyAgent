@@ -79,6 +79,7 @@ db.exec(`
 
 // Idempotent migrations
 try { db.exec(`ALTER TABLE nodes ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE nodes ADD COLUMN alias TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN context_aware INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
@@ -145,14 +146,56 @@ export function deleteExpiredPairCodes(): void {
 }
 
 // Node operations
+
+/**
+ * Derive a short, human-friendly alias from a worker name.
+ * Examples: "Spot.local" → "spot", "MacBook Pro" → "macbook_pro", "" → ""
+ * The alias is what users see in MCP tool names (e.g. `anyagent_claude_spot`)
+ * and in Telegram listings. Empty string falls back to a slice of node_id at
+ * display time — we never fabricate random aliases at storage time.
+ */
+export function deriveAlias(name: string): string {
+  const trimmed = (name ?? '').trim().toLowerCase()
+    .replace(/\.(local|lan|home|arpa)$/i, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return trimmed;
+}
+
+/**
+ * Resolve an alias that's guaranteed unique across approved nodes.
+ * If the desired alias is already taken by a DIFFERENT node, append `-2`,
+ * `-3`, etc. Used by insertNode and updateNodeName so per-node aliases stay
+ * addressable without operator intervention.
+ */
+function uniqueAlias(desired: string, forNodeId: string): string {
+  if (!desired) return '';
+  const existing = db.prepare(
+    `SELECT node_id FROM nodes WHERE alias = ? AND node_id != ?`
+  ).get(desired, forNodeId) as { node_id: string } | undefined;
+  if (!existing) return desired;
+  // Collision: walk -2, -3, ... until free
+  for (let i = 2; i < 100; i++) {
+    const candidate = `${desired}-${i}`;
+    const taken = db.prepare(
+      `SELECT node_id FROM nodes WHERE alias = ? AND node_id != ?`
+    ).get(candidate, forNodeId) as { node_id: string } | undefined;
+    if (!taken) return candidate;
+  }
+  // Absurd fallback — 99 collisions on the same alias. Include node_id hex.
+  return `${desired}-${forNodeId.slice(0, 8)}`;
+}
+
 export function insertNode(nodeId: string, publicKey: string, name?: string, description?: string): void {
+  const alias = uniqueAlias(deriveAlias(name ?? ''), nodeId);
   db.prepare(
-    `INSERT INTO nodes (node_id, public_key, name, description, approved) VALUES (?, ?, ?, ?, 1)`
-  ).run(nodeId, publicKey, name ?? '', description ?? '');
+    `INSERT INTO nodes (node_id, public_key, name, description, alias, approved) VALUES (?, ?, ?, ?, ?, 1)`
+  ).run(nodeId, publicKey, name ?? '', description ?? '', alias);
 }
 
 export function updateNodeName(nodeId: string, name: string): void {
-  db.prepare(`UPDATE nodes SET name = ? WHERE node_id = ?`).run(name, nodeId);
+  const alias = uniqueAlias(deriveAlias(name), nodeId);
+  db.prepare(`UPDATE nodes SET name = ?, alias = ? WHERE node_id = ?`).run(name, alias, nodeId);
 }
 
 export function updateNodeDescription(nodeId: string, description: string): void {
@@ -172,6 +215,37 @@ export function nodeExists(nodeId: string): boolean {
   return row !== undefined;
 }
 
+/**
+ * Render a user-facing alias for a node, with a stable fallback when the
+ * stored alias is empty (pre-migration rows or nameless workers).
+ */
+export function nodeDisplayAlias(node: Pick<NodeRow, 'alias' | 'node_id' | 'name'>): string {
+  if (node.alias && node.alias.length > 0) return node.alias;
+  const fromName = deriveAlias(node.name || '');
+  if (fromName) return fromName;
+  // Last resort: short hex slice of node_id — e.g. "b033c0f0"
+  return node.node_id.replace(/^node_/, '').slice(0, 8);
+}
+
+/**
+ * Resolve a node_id by alias. Used when a user types `claude@spot` and we
+ * need to find the corresponding worker.
+ */
+export function getNodeByAlias(alias: string): NodeRow | undefined {
+  return db.prepare(`SELECT * FROM nodes WHERE alias = ? AND approved = 1`).get(alias) as NodeRow | undefined;
+}
+
+// One-time backfill at startup: any approved node whose alias is blank gets
+// one derived from its name (or a node_id slice if nameless).
+(function backfillAliases(): void {
+  const rows = db.prepare(`SELECT node_id, name FROM nodes WHERE alias = '' OR alias IS NULL`).all() as Array<{ node_id: string; name: string }>;
+  for (const r of rows) {
+    const desired = deriveAlias(r.name) || r.node_id.replace(/^node_/, '').slice(0, 8);
+    const alias = uniqueAlias(desired, r.node_id);
+    db.prepare(`UPDATE nodes SET alias = ? WHERE node_id = ?`).run(alias, r.node_id);
+  }
+})();
+
 // Agent operations
 export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[], contextAware?: boolean): void {
   // Keyed on (name, node_id) — prevents cross-worker agent name hijacking
@@ -189,8 +263,46 @@ export function getAgentsByNodeId(nodeId: string): AgentRow[] {
   return db.prepare(`SELECT * FROM agents WHERE node_id = ?`).all(nodeId) as AgentRow[];
 }
 
+/**
+ * Resolve an agent by name, with a deterministic tie-break when multiple nodes
+ * declare the same agent name:
+ *   1. Prefer agents on currently-approved nodes (should be all of them)
+ *   2. Prefer older pairings (ORDER BY agents.created_at ASC)
+ * Callers that need a specific machine's agent MUST use getAgentByNameAndAlias
+ * or getAgentByNameAndNode — those never collapse name collisions.
+ */
 export function getAgentByName(name: string): AgentRow | undefined {
-  return db.prepare(`SELECT * FROM agents WHERE name = ?`).get(name) as AgentRow | undefined;
+  return db.prepare(
+    `SELECT a.* FROM agents a
+     JOIN nodes n ON n.node_id = a.node_id
+     WHERE a.name = ? AND n.approved = 1
+     ORDER BY a.created_at ASC
+     LIMIT 1`
+  ).get(name) as AgentRow | undefined;
+}
+
+/**
+ * Look up an agent by (name, node alias) — the canonical form for explicit
+ * addressing like `claude@spot`. Returns undefined if either the alias doesn't
+ * exist or the node has no agent by that name.
+ */
+export function getAgentByNameAndAlias(name: string, alias: string): AgentRow | undefined {
+  return db.prepare(
+    `SELECT a.* FROM agents a
+     JOIN nodes n ON n.node_id = a.node_id
+     WHERE a.name = ? AND n.alias = ? AND n.approved = 1
+     LIMIT 1`
+  ).get(name, alias) as AgentRow | undefined;
+}
+
+/**
+ * Look up an agent by (name, node_id). Used when we already have the node_id
+ * from a session or task record and don't want to go through alias resolution.
+ */
+export function getAgentByNameAndNode(name: string, nodeId: string): AgentRow | undefined {
+  return db.prepare(
+    `SELECT * FROM agents WHERE name = ? AND node_id = ? LIMIT 1`
+  ).get(name, nodeId) as AgentRow | undefined;
 }
 
 export function getAllAgents(): AgentRow[] {
