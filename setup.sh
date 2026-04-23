@@ -172,10 +172,10 @@ chmod 600 hub/.env
 
 # --- Step 5: Install + build --------------------------------------------------
 
-(cd sdk && npm ci --silent && npm run build) 2>&1 | grep -v "^$" || die "SDK build failed. Check Node version and build tools." "sdk-build-failed"
+(cd sdk && npm ci --silent && npm run build) || die "SDK build failed. Check Node version and build tools." "sdk-build-failed"
 echo -e "${GREEN}✓${NC} SDK built"
 
-(cd hub && npm ci --silent && npm run build) 2>&1 | grep -v "^$" || die "Hub build failed. See docs/TROUBLESHOOTING.md#hub-build-failed" "hub-build-failed"
+(cd hub && npm ci --silent && npm run build) || die "Hub build failed. See docs/TROUBLESHOOTING.md#hub-build-failed" "hub-build-failed"
 echo -e "${GREEN}✓${NC} Hub built"
 
 # --- Step 6: (optional) verify boot -------------------------------------------

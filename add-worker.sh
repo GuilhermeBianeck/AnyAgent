@@ -65,7 +65,8 @@ fi
 echo ""
 echo -e "${BOLD}Step 1: Hub connection${NC}"
 
-HUB_URL=""
+# Preserve HUB_URL if set in env (non-interactive callers rely on this).
+HUB_URL="${HUB_URL:-}"
 # Try mDNS discovery if we have a scanner. dns-sd (macOS) or avahi-browse (Linux).
 # Skip in non-interactive mode — user can pass HUB_URL env directly.
 if [ "$NONINTERACTIVE" != "1" ]; then
@@ -94,7 +95,7 @@ fi
 
 if [ -z "$HUB_URL" ]; then
   if [ "$NONINTERACTIVE" = "1" ]; then
-    HUB_URL="${HUB_URL_ENV:-${HUB_URL:-ws://localhost:8080}}"
+    HUB_URL="ws://localhost:8080"
   else
     echo "  Enter the hub's WebSocket URL (e.g. ws://192.168.1.5:8080)."
     read -p "  Hub URL [ws://localhost:8080]: " HUB_URL
@@ -239,10 +240,10 @@ echo -e "${BOLD}Step 6: Installing worker...${NC}"
 } > worker/.env
 chmod 600 worker/.env
 
-(cd sdk && npm ci --silent && npm run build) 2>&1 | grep -v "^$" || die "SDK build failed." "sdk-build-failed"
+(cd sdk && npm ci --silent && npm run build) || die "SDK build failed." "sdk-build-failed"
 echo -e "${GREEN}✓${NC} SDK built"
 
-(cd worker && npm ci --silent && npm run build) 2>&1 | grep -v "^$" || die "Worker build failed." "worker-build-failed"
+(cd worker && npm ci --silent && npm run build) || die "Worker build failed." "worker-build-failed"
 echo -e "${GREEN}✓${NC} Worker built"
 
 # --- Step 7 (optional): verify --------------------------------------------

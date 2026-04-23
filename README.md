@@ -52,6 +52,10 @@ Run agents on your machines — Claude Code, local LLMs, shell scripts, anything
 
 ## Quick Start
 
+> **Got Claude Code or Codex on this machine?** Paste the prompt in
+> [docs/SETUP-WITH-AI.md](docs/SETUP-WITH-AI.md) into your agent and it'll
+> do the whole install — hub, worker, or MCP-client role, your choice.
+
 ### Option 0 — One-line install (no git, no npm, no Node)
 
 ```bash
@@ -212,7 +216,8 @@ anyagent> route fix the authentication bug
 | `route <intent>` | Route by capability |
 | `switch` | Switch agent |
 | `stop` | Stop session |
-| `tasks` | Task history |
+| `tasks` | Last 10 tasks (compact view) |
+| `history [task_id]` | Last 20 tasks, or full detail for one |
 | `retry <id>` | Retry failed task |
 | `cancel <id>` | Cancel queued task |
 | `y` / `n` / `trust` | Approve / deny / trust pending task |
@@ -220,14 +225,16 @@ anyagent> route fix the authentication bug
 | `approve [off\|mcp\|always]` | Approval mode |
 | `context [set\|add\|clear]` | Operator context |
 | `revoke <node_id>` | Revoke worker |
-| `purge` | Clear history |
+| `purge` | Clear task history |
+| `events [watch]` | Recent worker/task events, or tail live |
+| `net` | Recent outbound connections (requires `AUDIT_NETWORK=1`) |
 | `status` | Current status |
 
 Any unrecognized text is forwarded as input to the active agent session.
 
 ### Telegram (optional — set `BOT_TOKEN`)
 
-Same commands with `/` prefix: `/pair`, `/workers`, `/agents`, `/call`, `/tasks`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
+Same commands with `/` prefix: `/pair`, `/workers`, `/agents`, `/call`, `/tasks`, `/history`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
 
 Plus: inline buttons for pairing approval, task approval/deny/trust, retry, cancel, and agent selection. Live pinned status message auto-updates every 30 seconds.
 
@@ -239,14 +246,15 @@ Plus: inline buttons for pairing approval, task approval/deny/trust, retry, canc
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALLOWED_USER_ID` | *required* | Your Telegram user ID (numeric) |
 | `BOT_TOKEN` | — | Telegram bot token. Omit to run CLI-only. |
+| `ALLOWED_USER_ID` | — | Your Telegram user ID (numeric). Required only when `BOT_TOKEN` is set. |
 | `WS_PORT` | `8080` | WebSocket port for workers |
 | `WS_SECRET` | — | Shared secret for worker auth (recommended) |
 | `MCP_PORT` | `3000` | MCP HTTP server port |
 | `MCP_TOKEN` | — | MCP bearer token. Omit to disable MCP server. |
 | `SESSION_TIMEOUT_MS` | `1800000` | Inactivity timeout (30 min) |
 | `MAX_QUEUE_DEPTH` | `3` | Max queued tasks per worker |
+| `AUTO_APPROVE_LOOPBACK` | — | Set `=1` to auto-approve pair requests from `127.0.0.1`/`::1`. Used by `quickstart.sh`; ignored for non-loopback connections. |
 
 ### Worker
 
