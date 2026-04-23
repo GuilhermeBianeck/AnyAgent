@@ -72,6 +72,11 @@ function renderSnippet(name: string, url: string, token: string): string {
   return JSON.stringify({
     mcpServers: {
       [name]: {
+        // `type` is REQUIRED for Claude Code to recognize an HTTP server.
+        // Without it, the CLI treats the entry as stdio and silently ignores
+        // it at session start. Confirmed against `claude mcp add --transport http`
+        // which writes the same shape.
+        type: 'http',
         url,
         headers: { Authorization: `Bearer ${token}` },
       },
@@ -121,6 +126,8 @@ async function main(): Promise<void> {
   }
 
   mcpServers[name] = {
+    // `type: 'http'` is required — see renderSnippet() for the rationale.
+    type: 'http',
     url: args.url,
     headers: { Authorization: `Bearer ${args.token}` },
   };

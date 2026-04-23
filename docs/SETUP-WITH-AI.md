@@ -155,36 +155,46 @@ First, verify the hub accepts my token (should NOT return 401):
     -H "Authorization: Bearer <TOKEN>" <URL>
     → 200, 400, or 405 are all fine. 401 means the token is wrong.
 
-Then wire the MCP entry. Two options — prefer (a) if AnyAgent is already cloned:
+Then wire the MCP entry. Pick whichever works on my setup:
 
-  (a) cd <path to AnyAgent>
-      node hub/dist/tools/wire-mcp.js --url "<URL>" --token "<TOKEN>"
+  (a) If the `claude` CLI is on PATH (canonical, recommended):
+        claude mcp add --scope user --transport http anyagent "<URL>" \
+          --header "Authorization: Bearer <TOKEN>"
+        claude mcp list   # verify it prints "anyagent: ... ✓ Connected"
 
-  (b) Edit ~/.claude.json manually. Back it up first:
-        cp ~/.claude.json ~/.claude.json.bak
-      Then add this under "mcpServers" (create the key if absent):
+  (b) If AnyAgent is already cloned here:
+        cd <path to AnyAgent>
+        node hub/dist/tools/wire-mcp.js --url "<URL>" --token "<TOKEN>"
+
+  (c) Manual edit of ~/.claude.json (back up first: cp ~/.claude.json ~/.claude.json.bak).
+      Add this under "mcpServers" — the `"type": "http"` field is REQUIRED, without
+      it Claude Code silently treats the entry as stdio and ignores it:
         "anyagent": {
+          "type": "http",
           "url": "<URL>",
           "headers": { "Authorization": "Bearer <TOKEN>" }
         }
-      For Cursor, do the same edit on ~/.cursor/mcp.json.
+      For Cursor, edit ~/.cursor/mcp.json with the same shape.
 
 Tell me:
-  - Reopen Claude Code / Cursor fully (not just a window).
-  - Try: "use anyagent_list_agents" — I should see the hub's agents.
+  - FULLY quit Claude Code / Cursor (⌘Q, not just close the window).
+    MCP server lists are read at session start and NOT hot-reloaded.
+  - Reopen, start a fresh conversation, try: "use anyagent_list_agents"
 
 ===================== ON FAILURE =====================
 If any step fails, grep docs/TROUBLESHOOTING.md for a matching anchor and
 suggest the fix. The most common ones:
 
-  nodejs-too-old       hub needs Node 22+; worker needs Node 20+
-  port-in-use          :8080 or :3000 already bound (lsof -iTCP:PORT)
-  firewall-blocking    cloud provider's security group, not just ufw
-  pair-code-missing    codes expire in 10 min; generate a new one
-  worker-not-authenticated   WS_SECRET doesn't match hub↔worker
-  binary-not-on-path   worker service's PATH doesn't include the CLI
-  cli-not-authenticated      I forgot `claude /login` on the worker
-  mcp-401              wrong Authorization header shape or MCP_TOKEN
+  nodejs-too-old          hub needs Node 22+; worker needs Node 20+
+  port-in-use             :8080 or :3000 already bound (lsof -iTCP:PORT)
+  firewall-blocking       cloud provider's security group, not just ufw
+  pair-code-missing       codes expire in 10 min; generate a new one
+  worker-not-authenticated  WS_SECRET doesn't match hub↔worker
+  binary-not-on-path      worker service's PATH doesn't include the CLI
+  cli-not-authenticated   I forgot `claude /login` on the worker
+  posix-spawnp-failed     node-pty spawn-helper lost +x; or launchd PATH misses the CLI
+  mcp-tool-not-found      anyagent_* missing after reopen — `type: "http"` required
+  mcp-401                 wrong Authorization header shape or MCP_TOKEN
 
 Do NOT use destructive shortcuts (rm -rf, git reset --hard, skipping hooks)
 to work around an error. Diagnose first, ask me if you're unsure.

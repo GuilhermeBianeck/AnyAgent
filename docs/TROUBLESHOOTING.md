@@ -161,6 +161,36 @@ Credentials live in the CLI's own config dir and persist between spawns.
 
 **Fix:** this is expected. Running tasks can't survive a hub restart because the PTY on the worker has already been killed. Queued tasks ARE preserved and re-dispatched on worker reconnect.
 
+## mcp-tool-not-found
+
+**Symptom:** After wiring the MCP server in `~/.claude.json` and reopening Claude Code, `anyagent_list_agents` (or any `anyagent_*` tool) isn't callable. The CLI says "No tool named anyagent_codex is available" or similar.
+
+**Root cause:** Claude Code requires a `"type": "http"` field for HTTP MCP servers. If the entry has `url` and `headers` but no `type`, the CLI treats it as stdio, fails to parse, and silently omits it from the tool list.
+
+**Fix, three options:**
+
+1. **Easiest — use `claude mcp add`** (canonical path, handles the field shape for you):
+   ```bash
+   claude mcp add --scope user --transport http anyagent http://HUB_HOST:3000 \
+     --header "Authorization: Bearer MCP_TOKEN"
+   claude mcp list     # should print "anyagent: ... ✓ Connected"
+   ```
+
+2. **Re-run the updated `wire-mcp.js`** — in AnyAgent builds dated 2026-04-23 or later, `node hub/dist/tools/wire-mcp.js --url ... --token ...` writes the correct shape including `type`.
+
+3. **Manual edit** of `~/.claude.json`, adding the missing field:
+   ```json
+   "mcpServers": {
+     "anyagent": {
+       "type": "http",
+       "url": "http://HUB_HOST:3000",
+       "headers": { "Authorization": "Bearer MCP_TOKEN" }
+     }
+   }
+   ```
+
+**Then fully quit Claude Code** (`⌘Q` on macOS — closing the window is not enough) and reopen. MCP tool manifests are loaded at session start and not hot-reloaded when the config file changes.
+
 ## mcp-401
 
 **Symptom:** MCP client (Claude Code, Cursor) returns `Unauthorized`.
