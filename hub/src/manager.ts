@@ -97,6 +97,39 @@ export function findAgentByCapability(intent: string): RoutingResult {
   return { type: 'ambiguous', agents: onlineAgents, method: 'user_selected' };
 }
 
+/**
+ * Pick an agent when the caller supplied only a short name like "claude" —
+ * e.g. via the MCP tool `anyagent_claude`. Deterministic so the same input
+ * always picks the same node on a given fleet state:
+ *   1. Online agents win over offline.
+ *   2. Tie-break by oldest pairing (ORDER BY agents.created_at ASC).
+ *   3. Log the decision so operators can see *why* their task landed on
+ *      a specific machine when they didn't pick one.
+ *
+ * Returns undefined when no agent with that name exists. Callers who want
+ * to address a specific node should use getAgentByNameAndAlias directly.
+ */
+export function resolveShortFormAgent(name: string): AgentRow | undefined {
+  const candidates = getAllAgents().filter(a => a.name === name);
+  if (candidates.length === 0) return undefined;
+
+  candidates.sort((a, b) => {
+    const aOnline = isNodeOnline(a.node_id) ? 0 : 1;
+    const bOnline = isNodeOnline(b.node_id) ? 0 : 1;
+    if (aOnline !== bOnline) return aOnline - bOnline;
+    // created_at is ISO-8601 from SQLite's datetime('now'); string compare works.
+    return a.created_at.localeCompare(b.created_at);
+  });
+
+  const picked = candidates[0];
+  if (candidates.length > 1) {
+    // The alternates are useful when diagnosing "why didn't it pick Beacon?"
+    const alternates = candidates.slice(1).map(c => `${c.name}@${c.node_id.slice(0, 12)}`).join(', ');
+    console.log(`[router] anyagent_${name} → ${name}@${picked.node_id} (online=${isNodeOnline(picked.node_id)}, skipped: ${alternates})`);
+  }
+  return picked;
+}
+
 // --- Task lifecycle ---
 
 export function startAgentForTask(

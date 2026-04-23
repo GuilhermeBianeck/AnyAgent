@@ -6,7 +6,7 @@ import { timingSafeEqual } from 'crypto';
 import { getTask } from './db.js';
 import {
   findAgentByCapability, createTaskId, startAgentForTask,
-  getAgentList, getWorkerList,
+  getAgentList, getWorkerList, resolveShortFormAgent,
 } from './manager.js';
 import { getContext } from './context.js';
 import type { TaskRow } from './types.js';
@@ -33,11 +33,18 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
   return null;
 }
 
-async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit'): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
-  const { getAgentByName } = await import('./db.js');
-  const agent = getAgentByName(agentName);
+async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+  const { getAgentByNameAndAlias } = await import('./db.js');
+  // If the caller targeted a specific node via `anyagent_<name>_<alias>`, resolve
+  // it that way — never collapse the collision to some other node.
+  const agent = options?.explicitAlias
+    ? getAgentByNameAndAlias(agentName, options.explicitAlias)
+    : resolveShortFormAgent(agentName);
   if (!agent) {
-    return { content: [{ type: 'text', text: `Agent ${agentName} not found.` }], isError: true };
+    const hint = options?.explicitAlias
+      ? `Agent "${agentName}@${options.explicitAlias}" not found (alias may be stale — try anyagent_list_agents).`
+      : `Agent "${agentName}" not found.`;
+    return { content: [{ type: 'text', text: hint }], isError: true };
   }
 
   const taskId = createTaskId();
@@ -154,7 +161,15 @@ function registerStaticTools(server: McpServer): void {
       if (!task) {
         return { content: [{ type: 'text' as const, text: `Task ${task_id} not found.` }], isError: true };
       }
-      let text = `Task: ${task.task_id}\nStatus: ${task.status}\nAgent: ${task.agent_name ?? 'none'}\nIntent: ${task.intent}`;
+      // Surface WHICH machine the task ran on so the operator knows which
+      // worker to look at for logs, CLI state, etc. when they didn't pick.
+      let onNode = '';
+      if (task.node_id) {
+        const { getNodeById, nodeDisplayAlias } = await import('./db.js');
+        const node = getNodeById(task.node_id);
+        if (node) onNode = `@${nodeDisplayAlias(node)}`;
+      }
+      let text = `Task: ${task.task_id}\nStatus: ${task.status}\nAgent: ${task.agent_name ? task.agent_name + onNode : 'none'}\nIntent: ${task.intent}`;
       if (task.result_summary) text += `\nResult: ${task.result_summary}`;
       if (task.error) text += `\nError: ${task.error}`;
       return { content: [{ type: 'text' as const, text }] };
@@ -172,19 +187,63 @@ function registerStaticTools(server: McpServer): void {
   );
 }
 
+// MCP tool names must be `[a-zA-Z0-9_-]`. Worker-declared names already come
+// from a sanitised JSON, but we still defensively strip anything unusual here.
+function mcpSafe(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function registerDynamicAgentTools(server: McpServer): void {
   const agents = getAgentList();
-  for (const agent of agents) {
-    const caps = agent.capabilities.length > 0 ? ` [${agent.capabilities.join(', ')}]` : '';
+
+  // ---- Short-form tools (one per distinct agent NAME, regardless of node) ----
+  // Register `anyagent_<name>` once per distinct name. The handler uses the
+  // deterministic picker in manager.resolveShortFormAgent so the user can't see
+  // the shape change under them as workers come online/offline — the same input
+  // on the same fleet state always picks the same node.
+  const byName = new Map<string, typeof agents>();
+  for (const a of agents) {
+    if (!byName.has(a.name)) byName.set(a.name, []);
+    byName.get(a.name)!.push(a);
+  }
+
+  for (const [name, variants] of byName.entries()) {
+    const caps = variants[0].capabilities.length > 0 ? ` [${variants[0].capabilities.join(', ')}]` : '';
+    const nodeCount = variants.length;
+    const nodeHint = nodeCount > 1
+      ? ` (available on ${nodeCount} machines: ${variants.map(v => v.nodeAlias).sort().join(', ')} — hub picks the oldest online pairing by default; use anyagent_${mcpSafe(name)}_<alias> to target a specific one)`
+      : '';
     server.tool(
-      `anyagent_${agent.name}`,
-      `${agent.description || agent.name}${caps}`,
+      `anyagent_${mcpSafe(name)}`,
+      `${variants[0].description || name}${caps}${nodeHint}`,
       {
         intent: z.string().describe('What you want this agent to do'),
         timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms waiting for result. Omit for async.'),
       },
       async ({ intent, timeout_ms }) => {
-        return handleToolCall(agent.name, intent, timeout_ms, 'explicit');
+        return handleToolCall(name, intent, timeout_ms, 'explicit');
+      }
+    );
+  }
+
+  // ---- Explicit per-machine tools ----
+  // For every registered agent, expose `anyagent_<name>_<alias>` so callers
+  // that know which machine they want can address it unambiguously. This is
+  // the recommended form when more than one node has an agent with the same
+  // name — the short form falls back to the picker, which can surprise you.
+  for (const a of agents) {
+    const toolName = `anyagent_${mcpSafe(a.name)}_${mcpSafe(a.nodeAlias)}`;
+    const caps = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
+    const nodeName = a.nodeName && a.nodeName !== a.nodeAlias ? ` (${a.nodeName})` : '';
+    server.tool(
+      toolName,
+      `${a.description || a.name} on ${a.nodeAlias}${nodeName}${caps}`,
+      {
+        intent: z.string().describe('What you want this agent to do'),
+        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms waiting for result. Omit for async.'),
+      },
+      async ({ intent, timeout_ms }) => {
+        return handleToolCall(a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
       }
     );
   }
