@@ -161,6 +161,22 @@ Credentials live in the CLI's own config dir and persist between spawns.
 
 **Fix:** this is expected. Running tasks can't survive a hub restart because the PTY on the worker has already been killed. Queued tasks ARE preserved and re-dispatched on worker reconnect.
 
+## agents-same-name
+
+**Symptom:** Two (or more) workers each declared an agent named `claude` (or `codex`, or any other). In `/agents`, `anyagent_list_agents`, or the CLI, they used to show up as one entry — the second registration silently overwrote the first and routing was undefined.
+
+**Fix:** v2.1+ groups every listing by the worker's **alias** (derived from its `WORKER_NAME`, e.g. `Spot.local` → `spot`). Each machine shows its agents under its own header, and MCP exposes two tool forms per agent:
+
+```
+anyagent_claude           # short form — hub picks the oldest online pairing
+anyagent_claude_spot      # explicit — targets that machine's claude
+anyagent_claude_beacon    # explicit — the other machine's claude
+```
+
+Use the explicit form when you need to address a specific machine. The short form is deterministic within a given fleet state (online agents first, then oldest pairing wins), and every multi-candidate resolution is logged at `[router]` so you can see which node it picked.
+
+`/call claude@spot` and `/call claude@beacon` work the same way in Telegram and the hub CLI. The pinned status message shows a per-machine agent count so you know, at a glance, what each node is carrying.
+
 ## mcp-tool-not-found
 
 **Symptom:** After wiring the MCP server in `~/.claude.json` and reopening Claude Code, `anyagent_list_agents` (or any `anyagent_*` tool) isn't callable. The CLI says "No tool named anyagent_codex is available" or similar.

@@ -70,12 +70,15 @@ async function sendHtmlDirect(bot: Bot, chatId: number, html: string, extra: Rec
 
 // --- Helper to render TaskStartResult from manager to Telegram ---
 async function renderTaskStart(bot: Bot, chatId: number, result: ReturnType<typeof startAgentForTask>, taskId: string): Promise<void> {
+  // Show "agent@alias" so the operator sees which machine their task landed
+  // on — especially relevant when the short form resolved through the picker.
+  const target = result.nodeAlias ? `${result.agentName}@${result.nodeAlias}` : result.agentName;
   switch (result.outcome) {
     case 'started':
-      await sendHtmlDirect(bot, chatId, `✅ <code>${escapeHtml(result.agentName)}</code> started. Send messages to interact. /stop to end.`);
+      await sendHtmlDirect(bot, chatId, `✅ <code>${escapeHtml(target)}</code> started. Send messages to interact. /stop to end.`);
       break;
     case 'queued':
-      await sendHtmlDirect(bot, chatId, `⏳ <code>${escapeHtml(result.agentName)}</code> is busy. Queued (position #${result.queuePosition}).`, {
+      await sendHtmlDirect(bot, chatId, `⏳ <code>${escapeHtml(target)}</code> is busy. Queued (position #${result.queuePosition}).`, {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cancel:${taskId}` }]] },
       });
       break;
@@ -83,7 +86,7 @@ async function renderTaskStart(bot: Bot, chatId: number, result: ReturnType<type
       const task = getTask(taskId);
       const intentPreview = (task?.intent ?? '').length > 80 ? (task?.intent ?? '').slice(0, 80) + '...' : (task?.intent ?? '');
       await sendHtmlDirect(bot, chatId,
-        `📋 <b>Task approval required</b>\n<i>${escapeHtml(intentPreview)}</i>\n→ <code>${escapeHtml(result.agentName)}</code>`, {
+        `📋 <b>Task approval required</b>\n<i>${escapeHtml(intentPreview)}</i>\n→ <code>${escapeHtml(target)}</code>`, {
           reply_markup: {
             inline_keyboard: [
               [{ text: '✅ Approve', callback_data: `taskapprove:${taskId}` }],
@@ -95,13 +98,13 @@ async function renderTaskStart(bot: Bot, chatId: number, result: ReturnType<type
       break;
     }
     case 'offline':
-      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(result.agentName)}</code> — worker is offline.`);
+      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(target)}</code> — worker is offline.`);
       break;
     case 'queue_full':
-      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(result.agentName)}</code> — queue is full.`);
+      await sendHtmlDirect(bot, chatId, `❌ Agent <code>${escapeHtml(target)}</code> — queue is full.`);
       break;
     case 'failed':
-      await sendHtmlDirect(bot, chatId, `❌ Failed to start <code>${escapeHtml(result.agentName)}</code>.`, {
+      await sendHtmlDirect(bot, chatId, `❌ Failed to start <code>${escapeHtml(target)}</code>.`, {
         reply_markup: { inline_keyboard: [[{ text: '🔄 Retry', callback_data: `retry:${taskId}` }]] },
       });
       break;

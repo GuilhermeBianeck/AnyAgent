@@ -579,6 +579,19 @@ async function handleMessage(
       }
       if (params.name) updateNodeName(session.nodeId, params.name);
       if (params.description) updateNodeDescription(session.nodeId, params.description);
+
+      // Detect cross-node name collisions BEFORE deleting this node's old
+      // agents, so the log line reflects the true "other nodes already have
+      // this" state. Non-blocking — operators may intentionally run the same
+      // agent on multiple machines as a fleet.
+      const { getAllAgents: dbGetAllAgents, getNodeById: dbGetNodeById } = await import('./db.js');
+      const existingByName = new Map<string, string[]>(); // name → [other node_ids]
+      for (const existing of dbGetAllAgents()) {
+        if (existing.node_id === session.nodeId) continue;
+        if (!existingByName.has(existing.name)) existingByName.set(existing.name, []);
+        existingByName.get(existing.name)!.push(existing.node_id);
+      }
+
       // Replace all agents for this node only — namespaced by node_id
       deleteAgentsByNodeId(session.nodeId);
       for (const agent of params.agents ?? []) {
@@ -586,6 +599,20 @@ async function handleMessage(
       }
       const pv = params.protocolVersion ?? 1;
       console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s), protocol v${pv}`);
+
+      // Surface the collision so operators can see MCP will now expose both
+      // short form (ambiguous) and explicit per-node forms. Helpful when a
+      // fresh worker unexpectedly shares a name with an existing one.
+      for (const agent of params.agents ?? []) {
+        const others = existingByName.get(agent.name);
+        if (!others || others.length === 0) continue;
+        const aliases = others
+          .map((id) => dbGetNodeById(id))
+          .filter((n): n is NonNullable<typeof n> => !!n)
+          .map((n) => (n.alias || n.node_id.slice(0, 12)));
+        console.warn(`[gateway] Agent "${agent.name}" on node ${session.nodeId} collides with ${others.length} other node(s): ${aliases.join(', ')}. MCP will expose anyagent_${agent.name}_<alias> for each.`);
+      }
+
       sendJson(session.ws, makeResult(req.id, { success: true }));
       for (const cb of agentChangeCallbacks) cb();
       break;

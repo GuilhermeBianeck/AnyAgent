@@ -66,21 +66,25 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
   // Blocking mode
   if (timeoutMs && timeoutMs > 0) {
     const completed = await waitForTask(taskId, timeoutMs);
+    const ranOn = result.nodeAlias ? ` (${result.agentName}@${result.nodeAlias})` : '';
     if (completed) {
       if (completed.status === 'complete') {
-        return { content: [{ type: 'text', text: completed.result_summary ?? 'Task completed.' }] };
+        const text = completed.result_summary ?? `Task completed${ranOn}.`;
+        return { content: [{ type: 'text', text }] };
       }
-      return { content: [{ type: 'text', text: `Task failed: ${completed.error ?? 'unknown'}` }], isError: true };
+      return { content: [{ type: 'text', text: `Task failed${ranOn}: ${completed.error ?? 'unknown'}` }], isError: true };
     }
-    return { content: [{ type: 'text', text: `Task ${taskId} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
+    return { content: [{ type: 'text', text: `Task ${taskId}${ranOn} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
   }
 
-  // Async mode
+  // Async mode — echo the resolved node so the operator sees WHICH machine
+  // their short-form call landed on without a follow-up anyagent_task_status.
+  const target = result.nodeAlias ? `${result.agentName}@${result.nodeAlias}` : result.agentName;
   const statusMsg = result.outcome === 'queued'
-    ? `Agent busy. Task ${taskId} queued.`
+    ? `Agent ${target} busy. Task ${taskId} queued.`
     : result.outcome === 'pending_approval'
-    ? `Task ${taskId} pending approval. Use anyagent_task_status to check.`
-    : `Task ${taskId} started on ${result.agentName}.`;
+    ? `Task ${taskId} pending approval for ${target}.`
+    : `Task ${taskId} started on ${target}.`;
   return { content: [{ type: 'text', text: `${statusMsg} Use anyagent_task_status to check.` }] };
 }
 

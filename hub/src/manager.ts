@@ -39,6 +39,12 @@ export interface TaskStartResult {
   outcome: 'started' | 'queued' | 'failed' | 'pending_approval' | 'offline' | 'queue_full';
   taskId: string;
   agentName: string;
+  /**
+   * Alias of the node the task was dispatched to (or would have been). Lets
+   * the UI render "Started claude@spot" instead of just "Started claude" so
+   * operators see WHICH machine picked up a short-form call.
+   */
+  nodeAlias?: string;
   error?: string;
   queuePosition?: number;
 }
@@ -139,7 +145,12 @@ export function startAgentForTask(
   chatId: number,
   routingMethod: RoutingMethod
 ): TaskStartResult {
-  const result: TaskStartResult = { outcome: 'failed', taskId, agentName: agent.name };
+  // Resolve the alias once up front so every outcome path carries it through
+  // to the UI without re-querying the DB. Falls back to a short node_id slice
+  // if the node row was somehow deleted mid-flight.
+  const node = getNodeById(agent.node_id);
+  const nodeAlias = node ? nodeDisplayAlias(node) : agent.node_id.replace(/^node_/, '').slice(0, 8);
+  const result: TaskStartResult = { outcome: 'failed', taskId, agentName: agent.name, nodeAlias };
 
   if (!isNodeOnline(agent.node_id)) {
     updateTaskStatus(taskId, 'failed', { error: 'Worker offline', agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });

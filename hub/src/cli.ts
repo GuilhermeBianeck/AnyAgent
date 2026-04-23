@@ -628,23 +628,24 @@ ${BOLD}Config${RESET}
   }
 
   function renderStartResult(result: ReturnType<typeof startAgentForTask>): void {
+    const target = result.nodeAlias ? `${result.agentName}@${result.nodeAlias}` : result.agentName;
     switch (result.outcome) {
       case 'started':
-        console.log(`${GREEN}✓${RESET} ${result.agentName} started. Type to interact, "stop" to end.`);
+        console.log(`${GREEN}✓${RESET} ${target} started. Type to interact, "stop" to end.`);
         break;
       case 'queued':
-        console.log(`${YELLOW}…${RESET} ${result.agentName} busy. Queued (position #${result.queuePosition}).`);
+        console.log(`${YELLOW}…${RESET} ${target} busy. Queued (position #${result.queuePosition}).`);
         break;
       case 'pending_approval':
-        console.log(`${YELLOW}?${RESET} Approval required for ${result.agentName}. Auto-denies in 5 min.`);
+        console.log(`${YELLOW}?${RESET} Approval required for ${target}. Auto-denies in 5 min.`);
         // CLI auto-approves for now (operator is at the terminal)
         // A future version could prompt y/n
         break;
       case 'offline':
-        console.log(`${RED}✗${RESET} ${result.agentName} — worker offline.`);
+        console.log(`${RED}✗${RESET} ${target} — worker offline.`);
         break;
       case 'queue_full':
-        console.log(`${RED}✗${RESET} ${result.agentName} — queue full.`);
+        console.log(`${RED}✗${RESET} ${target} — queue full.`);
         break;
       case 'failed':
         console.log(`${RED}✗${RESET} Failed: ${result.error ?? 'unknown'}`);

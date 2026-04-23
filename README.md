@@ -234,9 +234,11 @@ Any unrecognized text is forwarded as input to the active agent session.
 
 ### Telegram (optional — set `BOT_TOKEN`)
 
-Same commands with `/` prefix: `/pair`, `/workers`, `/agents`, `/call`, `/tasks`, `/history`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
+Same commands with `/` prefix: `/pair`, `/workers`, `/nodes`, `/agents`, `/call`, `/tasks`, `/history`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
 
-Plus: inline buttons for pairing approval, task approval/deny/trust, retry, cancel, and agent selection. Live pinned status message auto-updates every 30 seconds.
+`/agents` and `/nodes` group by machine (each worker has an **alias** derived from its `WORKER_NAME` — `Spot.local` → `spot`). `/call <name>` lets the hub pick (oldest online pairing wins); `/call <name>@<alias>` targets a specific machine when multiple workers declare the same agent name.
+
+Plus: inline buttons for pairing approval, task approval/deny/trust, retry, cancel, and agent selection. Live pinned status message auto-updates every 30 seconds and shows the agent count per machine.
 
 ---
 
