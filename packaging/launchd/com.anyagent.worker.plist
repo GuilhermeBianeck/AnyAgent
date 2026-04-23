@@ -16,8 +16,18 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!--
+            PATH must include the locations of the AI CLIs the worker may be
+            asked to spawn. launchd's default PATH is minimal, so we list the
+            common installer directories explicitly:
+              /Users/@USER@/.local/bin  — claude (Anthropic installer default)
+              /opt/homebrew/{bin,sbin}  — Homebrew on Apple Silicon
+              /usr/local/{bin,sbin}     — Homebrew on Intel / manual installs
+        -->
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>/Users/@USER@/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/@USER@</string>
     </dict>
 
     <key>RunAtLoad</key>

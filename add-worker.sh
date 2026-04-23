@@ -246,6 +246,11 @@ echo -e "${GREEN}✓${NC} SDK built"
 (cd worker && npm ci --silent && npm run build) || die "Worker build failed." "worker-build-failed"
 echo -e "${GREEN}✓${NC} Worker built"
 
+# node-pty ships prebuilt `spawn-helper` binaries but npm's tarball extraction
+# doesn't always preserve the +x bit. Without it every pty.spawn() call fails
+# with `posix_spawnp failed`. Set the bit defensively for every prebuilt we find.
+find worker/node_modules/node-pty/prebuilds -type f -name 'spawn-helper' -exec chmod +x {} \; 2>/dev/null || true
+
 # --- Step 7 (optional): verify --------------------------------------------
 
 if [ "$VERIFY" = "1" ]; then

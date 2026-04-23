@@ -125,7 +125,23 @@ Need a new code? Just type `pair` again.
 **Fix:**
 - Install the CLI on the **worker** machine (not the hub!) and make sure it's on the worker service's PATH.
 - For systemd, either set `PATH=/usr/local/bin:...` in `worker/.env` or install the binary into `/usr/bin`.
+- On macOS (launchd), the plist sets `PATH` explicitly because launchd's default is minimal. The installer seeds it with `/Users/<you>/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`; if your CLI lives elsewhere, edit `~/Library/LaunchAgents/com.anyagent.worker.plist` and `launchctl unload && load` it.
 - Run `cd worker && npm run doctor` to see exactly which binaries resolve.
+
+## posix-spawnp-failed
+
+**Symptom:** MCP calls return `Task failed: posix_spawnp failed.` for *every* agent, regardless of which CLI. Worker logs show `new UnixTerminal (.../node-pty/lib/unixTerminal.js:92)`.
+
+**Root cause:** `node-pty`'s prebuilt `spawn-helper` binary lost its execute bit during npm extraction. Without it, every `pty.spawn()` call fails at the syscall level — before PATH lookup even happens.
+
+**Fix:**
+```bash
+find worker/node_modules/node-pty/prebuilds -type f -name 'spawn-helper' -exec chmod +x {} \;
+launchctl unload ~/Library/LaunchAgents/com.anyagent.worker.plist
+launchctl load ~/Library/LaunchAgents/com.anyagent.worker.plist
+```
+
+`add-worker.sh` and `quickstart.sh` apply the `chmod +x` automatically after `npm ci` — this manual fix is only needed if you installed `node-pty` by other means or a package manager stripped permissions later.
 
 ## cli-not-authenticated
 

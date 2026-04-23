@@ -129,6 +129,9 @@ echo -e "${DIM}Building hub + sdk + worker...${NC}"
 (cd sdk    && npm ci --silent && npm run build --silent) > /dev/null 2>&1 || die "SDK build failed. See docs/TROUBLESHOOTING.md" "sdk-build-failed"
 (cd hub    && npm ci --silent && npm run build --silent) > /dev/null 2>&1 || die "Hub build failed." "hub-build-failed"
 (cd worker && npm ci --silent && npm run build --silent) > /dev/null 2>&1 || die "Worker build failed." "worker-build-failed"
+# npm's tarball extraction can drop the +x bit on node-pty's prebuilt spawn-helper,
+# which makes every pty.spawn() fail with `posix_spawnp failed`. Reassert it.
+find worker/node_modules/node-pty/prebuilds -type f -name 'spawn-helper' -exec chmod +x {} \; 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Built"
 
 # --- 5. Write hub/.env ------------------------------------------------------

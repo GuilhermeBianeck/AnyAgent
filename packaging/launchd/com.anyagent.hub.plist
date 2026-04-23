@@ -23,7 +23,9 @@
         <!-- dotenv/config inside the hub reads hub/.env, so we don't need to repeat vars here.
              PATH is still useful because launchd starts with a minimal PATH. -->
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>/Users/@USER@/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/@USER@</string>
     </dict>
 
     <key>RunAtLoad</key>

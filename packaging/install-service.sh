@@ -7,7 +7,7 @@
 #
 # Detects OS and picks systemd (Linux) or launchd (macOS).
 # Templates /packaging/systemd/*.service or /packaging/launchd/*.plist with:
-#   @USER@    — current user (systemd only)
+#   @USER@    — current user (systemd + launchd — needed for PATH and HOME on macOS)
 #   @GROUP@   — current group (systemd only)
 #   @WORKDIR@ — absolute path to AnyAgent checkout
 #   @NODE@    — absolute path to the `node` binary
@@ -105,6 +105,7 @@ elif [ "$OS" = "Darwin" ]; then
   mkdir -p "$HOME/Library/LaunchAgents"
 
   sed \
+    -e "s|@USER@|$(id -un)|g" \
     -e "s|@WORKDIR@|$WORKDIR|g" \
     -e "s|@NODE@|$NODE_BIN|g" \
     "$PLIST_SRC" > "$PLIST_DST"
