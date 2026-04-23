@@ -292,21 +292,31 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
 
   async function updatePinnedStatus(): Promise<void> {
     if (!pinnedChatId || !pinnedMessageId) return;
-    const nodes = getAllNodes();
-    const agents = getAllAgents();
-    const onlineNodes = nodes.filter(n => isNodeOnline(n.node_id));
+    const workers = getWorkerList();      // includes alias
+    const agents = getAgentList();        // includes nodeAlias
+    const onlineWorkers = workers.filter(w => w.online);
     const defaultAgent = getDefaultAgent(pinnedChatId);
     const session = getActiveSessionByChatId(pinnedChatId);
     const recentTasks = getRecentTasksByChatId(pinnedChatId, 3);
     const mcpPort = process.env.MCP_PORT;
 
-    let text = '<b>📍 AnyAgent Status</b>\n\n';
-    text += `<b>Workers:</b> ${onlineNodes.length}/${nodes.length} online\n`;
-    for (const n of nodes) {
-      const status = isNodeOnline(n.node_id) ? '🟢' : '🔴';
-      text += `  ${status} ${escapeHtml(n.name || n.node_id)}\n`;
+    // Pre-tally agents per node so each worker line can show how many agents
+    // it exposes — at a glance the operator sees "spot has 3, beacon has 2"
+    // which is the info they were previously fishing for in /agents.
+    const agentCountByNode = new Map<string, number>();
+    for (const a of agents) {
+      agentCountByNode.set(a.nodeAlias, (agentCountByNode.get(a.nodeAlias) ?? 0) + 1);
     }
-    text += `\n<b>Agents:</b> ${agents.length} registered\n`;
+
+    let text = '<b>📍 AnyAgent Status</b>\n\n';
+    text += `<b>Workers:</b> ${onlineWorkers.length}/${workers.length} online\n`;
+    for (const w of workers) {
+      const status = w.online ? '🟢' : '🔴';
+      const count = agentCountByNode.get(w.alias) ?? 0;
+      const label = w.name && w.name !== w.alias ? `${w.alias} (${w.name})` : w.alias;
+      text += `  ${status} ${escapeHtml(label)} — ${count} agent${count === 1 ? '' : 's'}\n`;
+    }
+    text += `\n<b>Agents:</b> ${agents.length} registered across ${workers.length} worker${workers.length === 1 ? '' : 's'}\n`;
     if (mcpPort) {
       text += `<b>MCP:</b> port ${escapeHtml(mcpPort)}\n`;
     }
@@ -345,10 +355,11 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       '<b>AnyAgent</b> — personal MCP bridge for distributed agents.\n\n' +
       '<b>Setup</b>\n' +
       '/pair — Pair a new worker\n' +
-      '/workers — List registered workers\n\n' +
+      '/workers — List registered workers\n' +
+      '/nodes — Machines + their agents in one view\n\n' +
       '<b>Usage</b>\n' +
-      '/agents — List agents (tap to start)\n' +
-      '/call <code>&lt;name&gt;</code> — Start an agent session\n' +
+      '/agents — List agents grouped by machine (tap to start)\n' +
+      '/call <code>&lt;name&gt;</code> or <code>&lt;name&gt;@&lt;alias&gt;</code> — Start an agent; use @alias to target a specific machine\n' +
       '/tasks — Recent task history\n' +
       '/history — Full task history (tap for detail)\n' +
       '/stop — Stop the active session\n\n' +
@@ -424,6 +435,52 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
   bot.command('workers', handleWorkers);
   bot.command('devices', handleWorkers);
   bot.command('list', handleWorkers);
+
+  // --- /nodes — shortcut view showing each machine and the agents it carries ---
+  // `/workers` lists the machines alone; `/nodes` folds the agent inventory
+  // into each entry so the operator sees, in one shot, which agents run
+  // where without having to drill in.
+  bot.command('nodes', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const workers = getWorkerList();
+    const agents = getAgentList();
+    if (workers.length === 0) {
+      await ctx.reply('No workers registered. Use /pair to add one.');
+      return;
+    }
+    const byNode = new Map<string, typeof agents>();
+    for (const a of agents) {
+      if (!byNode.has(a.nodeAlias)) byNode.set(a.nodeAlias, []);
+      byNode.get(a.nodeAlias)!.push(a);
+    }
+    const lines: string[] = ['<b>Nodes:</b>'];
+    // Sort workers alphabetically by alias for stable output.
+    const sorted = [...workers].sort((a, b) => a.alias.localeCompare(b.alias));
+    for (const w of sorted) {
+      const status = w.online ? '🟢' : '🔴';
+      const nameSuffix = w.name && w.name !== w.alias ? ` (${escapeHtml(w.name)})` : '';
+      const desc = w.description ? ` — ${escapeHtml(w.description)}` : '';
+      lines.push(`\n${status} <b>${escapeHtml(w.alias)}</b>${nameSuffix}${desc}`);
+      const mine = byNode.get(w.alias) ?? [];
+      if (mine.length === 0) {
+        lines.push('   <i>(no agents declared)</i>');
+      } else {
+        for (const a of mine) {
+          const caps = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
+          lines.push(`   ${a.online ? '🟢' : '🔴'} <code>${escapeHtml(a.name)}@${escapeHtml(w.alias)}</code>${caps}`);
+        }
+      }
+    }
+    // Offer inline buttons to start any agent directly from this view.
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (const w of sorted) {
+      for (const a of byNode.get(w.alias) ?? []) {
+        if (!a.online) continue;
+        buttons.push([{ text: `▶️ ${a.name}@${w.alias}`, callback_data: `call:${a.name}@${w.alias}` }]);
+      }
+    }
+    await sendHtml(ctx, lines.join('\n'), buttons.length > 0 ? { reply_markup: { inline_keyboard: buttons } } : undefined);
+  });
 
   // --- /agents (grouped by machine) ---
   bot.command('agents', async (ctx) => {
@@ -604,12 +661,20 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     const matchText = ctx.match;
     const args = typeof matchText === 'string' ? matchText.trim().split(/\s+/) : [];
     if (args.length < 1 || !args[0]) {
-      await ctx.reply('Usage: /call <agent_name>');
+      await ctx.reply('Usage: /call <name> — or /call <name>@<alias> to target a specific machine');
       return;
     }
-    const agent = getAgentByName(args[0]);
+    // `/call claude@spot` → target that machine's claude. `/call claude` →
+    // hub picks with resolveShortFormAgent rules (via getAgentByName).
+    const spec = args[0];
+    const atIdx = spec.lastIndexOf('@');
+    const agentName = atIdx >= 0 ? spec.slice(0, atIdx) : spec;
+    const alias = atIdx >= 0 ? spec.slice(atIdx + 1) : '';
+    const agent = alias
+      ? (getAgentByNameAndAlias(agentName, alias) ?? getAgentByName(agentName))
+      : getAgentByName(agentName);
     if (!agent) {
-      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(args[0])}</code> not found.`);
+      await sendHtml(ctx, `❌ Agent <code>${escapeHtml(spec)}</code> not found. Try /agents to see available ones.`);
       return;
     }
     // Stop existing session
@@ -617,8 +682,8 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     if (existing) clearActiveSession(existing.nodeId);
 
     const taskId = createTaskId();
-    insertTask(taskId, 'telegram', `/call ${args[0]}`, ctx.chat!.id);
-    { const r = startAgentForTask(agent, taskId, `/call ${args[0]}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, r, taskId); }
+    insertTask(taskId, 'telegram', `/call ${spec}`, ctx.chat!.id);
+    { const r = startAgentForTask(agent, taskId, `/call ${spec}`, ctx.chat!.id, 'explicit'); await renderTaskStart(bot, ctx.chat!.id, r, taskId); }
     updatePinnedStatus();
   });
 
