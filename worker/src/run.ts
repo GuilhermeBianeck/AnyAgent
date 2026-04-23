@@ -123,7 +123,17 @@ Example:
         activeTerminal = session;
         worker.sendSpawnResult(true, session.pid);
         if (params.context) {
+          // MCP's model is one-shot: we have the full intent up front and won't
+          // stream more input later. Write the context line, then send Ctrl+D
+          // (0x04) — the canonical-mode EOF byte — so CLIs like `codex exec`
+          // and `claude -p` that read stdin to EOF actually see EOF and start
+          // processing. Without this they hang waiting for more input in the PTY.
+          //
+          // For CLIs that would otherwise stay interactive, EOF just means "no
+          // more user input for now" and the REPL exits cleanly — which is
+          // exactly what MCP wants.
           session.write(params.context + '\n');
+          session.write('\x04');
         }
       } catch (err: unknown) {
         // Surface the real error so SEA-asset-load / binary-missing failures

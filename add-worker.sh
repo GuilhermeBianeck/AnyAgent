@@ -157,6 +157,24 @@ declare_preset() {
   esac
 }
 
+# AnyAgent runs each spawn as a one-shot MCP call: intent goes in, result comes
+# back, process exits. These args put each known CLI into its non-interactive
+# print-and-exit mode so the PTY spawn actually terminates. `-` tells codex to
+# read the prompt from the PTY's stdin; --skip-git-repo-check disables codex's
+# requirement that the cwd be a git repo (the worker's cwd is $HOME).
+#
+# JSON array elements, comma-separated, no quotes — assembled into the
+# WORKER_AGENTS JSON below.
+args_preset() {
+  case "$1" in
+    claude)  echo '"-p"' ;;
+    codex)   echo '"exec","--skip-git-repo-check","-"' ;;
+    gemini)  echo '"-p"' ;;
+    aider)   echo '"--yes","--no-pretty"' ;;
+    *)       echo "" ;;
+  esac
+}
+
 CANDIDATES="claude codex ollama aider gemini bash python3"
 DETECTED=""
 for bin in $CANDIDATES; do
@@ -223,7 +241,11 @@ for i in "${!CAP_ARRAY[@]}"; do
 done
 CAPS_JSON="$CAPS_JSON]"
 
-AGENTS_JSON="[{\"name\":\"${AGENT_NAME}\",\"binary\":\"${AGENT_BINARY}\",\"args\":[],\"description\":\"${AGENT_DESC}\",\"capabilities\":${CAPS_JSON}}]"
+ARGS_PRESET=$(args_preset "$AGENT_BINARY")
+# Allow override via AGENT_ARGS env var (comma-separated JSON-quoted strings, e.g. '"-p","foo"').
+AGENT_ARGS="${AGENT_ARGS:-$ARGS_PRESET}"
+
+AGENTS_JSON="[{\"name\":\"${AGENT_NAME}\",\"binary\":\"${AGENT_BINARY}\",\"args\":[${AGENT_ARGS}],\"description\":\"${AGENT_DESC}\",\"capabilities\":${CAPS_JSON}}]"
 
 # --- Step 6: Write .env -----------------------------------------------------
 
