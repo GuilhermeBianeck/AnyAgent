@@ -143,28 +143,31 @@ fi
 echo ""
 echo -e "${BOLD}Step 5: Agents on this machine${NC}"
 
-# Probe for known AI CLIs on PATH — each maps to a preset capability list
+# Capability preset per known CLI. Comma-separated tags — the routing layer
+# matches intent keywords against these.
 declare_preset() {
   case "$1" in
-    claude) echo "coding,refactoring,testing,shell" ;;
-    codex)  echo "coding,review,refactoring" ;;
-    ollama) echo "llm,chat,local" ;;
-    aider)  echo "coding,git,refactoring" ;;
-    gemini) echo "coding,chat" ;;
-    bash)   echo "shell,scripts,ops" ;;
+    claude)  echo "coding,refactoring,testing,shell" ;;
+    codex)   echo "coding,review,refactoring" ;;
+    ollama)  echo "llm,chat,local" ;;
+    aider)   echo "coding,git,refactoring" ;;
+    gemini)  echo "coding,chat" ;;
+    bash)    echo "shell,scripts,ops" ;;
     python3) echo "scripting,data" ;;
-    *) echo "general" ;;
+    *)       echo "general" ;;
   esac
 }
 
-# AnyAgent runs each spawn as a one-shot MCP call: intent goes in, result comes
-# back, process exits. These args put each known CLI into its non-interactive
-# print-and-exit mode so the PTY spawn actually terminates. `-` tells codex to
-# read the prompt from the PTY's stdin; --skip-git-repo-check disables codex's
-# requirement that the cwd be a git repo (the worker's cwd is $HOME).
-#
-# JSON array elements, comma-separated, no quotes — assembled into the
-# WORKER_AGENTS JSON below.
+# One-shot arg preset per known CLI. AnyAgent spawns each CLI in PTY-one-shot
+# mode: intent goes in via stdin (worker appends Ctrl+D so EOF-readers like
+# `codex exec` actually process), result streams back, process exits. These
+# args put each CLI into its print-and-exit mode:
+#   codex exec --skip-git-repo-check -   # `-` ⇒ read prompt from stdin,
+#                                         #   --skip-git-repo-check lets codex
+#                                         #   run outside a git repo ($HOME)
+#   claude -p                            # Claude "print mode"
+# Elements are JSON-quoted strings, comma-separated; assembled into the
+# final WORKER_AGENTS JSON further down.
 args_preset() {
   case "$1" in
     claude)  echo '"-p"' ;;
@@ -175,77 +178,199 @@ args_preset() {
   esac
 }
 
-CANDIDATES="claude codex ollama aider gemini bash python3"
-DETECTED=""
+# Sanitise a free-form model name (e.g. "llama3.1:8b") into something legal
+# as an MCP tool suffix: lowercase, alphanum-or-underscore only. The same
+# routine is applied in mcpSafe() on the hub side, but we do it here so the
+# WORKER_AGENTS JSON that the hub stores has the right shape from the start.
+sanitize_model_id() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '_' | sed 's/^_*//; s/_*$//'
+}
+
+# Probe `ollama list` to find downloaded models. Each line after the header
+# starts with a model id like "llama3.1:8b" — the second token is the SHA.
+# Empty string when ollama is absent OR no models are present.
+probe_ollama_models() {
+  if ! command -v ollama >/dev/null 2>&1; then return; fi
+  ollama list 2>/dev/null | awk 'NR>1 && NF>0 {print $1}' | head -20
+}
+
+# Build a single-agent JSON object from a spec. Specs we understand:
+#   - bare CLI: `claude`, `codex`, `aider`, `gemini`, `bash`, `python3`
+#   - ollama model: `ollama:llama3.1:8b` → agent "ollama-llama3_1_8b"
+# The result is a JSON object (not an array) — the caller joins them into the
+# WORKER_AGENTS JSON array.
+build_agent_json() {
+  local spec="$1"
+  local binary name args caps model
+  if [[ "$spec" == ollama:* ]]; then
+    model="${spec#ollama:}"
+    binary="ollama"
+    name="ollama-$(sanitize_model_id "$model")"
+    # `ollama run <model>` is one-shot when stdin is piped AND closed — matches
+    # AnyAgent's PTY+EOF spawn pattern. The worker sends Ctrl+D after the intent.
+    args="\"run\",\"${model}\""
+    caps="llm,chat,local,${model%%:*}"
+  else
+    binary="$spec"
+    name="$spec"
+    args=$(args_preset "$spec")
+    caps=$(declare_preset "$spec")
+  fi
+
+  # Build capabilities JSON array from the comma-separated preset
+  local caps_json="["
+  local first=1
+  local cap
+  local CAP_ARR
+  IFS=',' read -ra CAP_ARR <<< "$caps"
+  for cap in "${CAP_ARR[@]}"; do
+    cap=$(echo "$cap" | tr -d '"\\`$\n\r ')
+    [ -z "$cap" ] && continue
+    [ "$first" -eq 0 ] && caps_json="$caps_json,"
+    caps_json="$caps_json\"$cap\""
+    first=0
+  done
+  caps_json="$caps_json]"
+
+  local desc_text
+  if [[ "$spec" == ollama:* ]]; then
+    desc_text="ollama ${model} on $(hostname -s 2>/dev/null || hostname)"
+  else
+    desc_text="${name} on $(hostname -s 2>/dev/null || hostname)"
+  fi
+
+  printf '{"name":"%s","binary":"%s","args":[%s],"description":"%s","capabilities":%s}' \
+    "$name" "$binary" "$args" "$desc_text" "$caps_json"
+}
+
+# Assemble the WORKER_AGENTS JSON array from a comma-separated spec list.
+build_agents_json() {
+  local binaries="$1"
+  local out="["
+  local first=1
+  local spec
+  local BIN_ARR
+  IFS=',' read -ra BIN_ARR <<< "$binaries"
+  for spec in "${BIN_ARR[@]}"; do
+    spec=$(echo "$spec" | tr -d ' ')
+    [ -z "$spec" ] && continue
+    [ "$first" -eq 0 ] && out="$out,"
+    out="$out$(build_agent_json "$spec")"
+    first=0
+  done
+  out="$out]"
+  printf '%s' "$out"
+}
+
+# Build the list of candidate specs we can show in the interactive picker:
+# one entry per CLI on PATH, plus one entry per downloaded ollama model.
+CANDIDATES="claude codex aider gemini bash python3"
+DETECTED_SPECS=()
 for bin in $CANDIDATES; do
   if command -v "$bin" >/dev/null 2>&1; then
-    DETECTED="$DETECTED $bin"
+    DETECTED_SPECS+=("$bin")
     echo -e "  ${GREEN}✓${NC} ${bin} (at $(command -v "$bin"))"
   fi
 done
-
-if [ -z "$DETECTED" ]; then
-  echo -e "  ${YELLOW}No known AI CLIs detected on PATH.${NC}"
-  echo "  You can still declare an agent manually — type the binary name below."
-fi
-
-if [ "$NONINTERACTIVE" = "1" ]; then
-  AGENT_BINARY="${AGENT_BINARY:-claude}"
-  AGENT_NAME="${AGENT_NAME:-$AGENT_BINARY}"
-  AGENT_DESC="${AGENT_DESC:-${AGENT_NAME} agent}"
-  AGENT_CAPS="${AGENT_CAPS:-$(declare_preset "$AGENT_BINARY")}"
-else
-  # Pick the first detected binary as default, else 'claude'
-  DEFAULT_BIN=$(echo "$DETECTED" | awk '{print $1}')
-  DEFAULT_BIN=${DEFAULT_BIN:-claude}
-  echo ""
-  read -p "  Binary to expose [${DEFAULT_BIN}]: " AGENT_BINARY
-  AGENT_BINARY=${AGENT_BINARY:-$DEFAULT_BIN}
-
-  # Health check the binary unless it's not on PATH (user may install later)
-  if command -v "$AGENT_BINARY" >/dev/null 2>&1; then
-    echo -e "  ${GREEN}✓${NC} ${AGENT_BINARY} is on PATH"
+# Ollama: one agent per downloaded model, not one lumpy "ollama" agent.
+if command -v ollama >/dev/null 2>&1; then
+  echo -e "  ${GREEN}✓${NC} ollama (at $(command -v ollama))"
+  _ollama_models=$(probe_ollama_models)
+  if [ -n "$_ollama_models" ]; then
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      DETECTED_SPECS+=("ollama:$m")
+      echo -e "      ${DIM}↳ ${m}${NC}"
+    done <<< "$_ollama_models"
   else
-    echo -e "  ${YELLOW}⚠${NC}  ${AGENT_BINARY} not on PATH — worker will error when the hub asks it to spawn."
-    echo "     Install it before starting the worker."
+    echo -e "      ${YELLOW}(no models downloaded — run \`ollama pull <model>\` first)${NC}"
   fi
-
-  read -p "  Agent display name [${AGENT_BINARY}]: " AGENT_NAME
-  AGENT_NAME=${AGENT_NAME:-$AGENT_BINARY}
-
-  read -p "  Description [${AGENT_NAME} agent]: " AGENT_DESC
-  AGENT_DESC=${AGENT_DESC:-"${AGENT_NAME} agent"}
-
-  DEFAULT_CAPS=$(declare_preset "$AGENT_BINARY")
-  echo ""
-  echo -e "  ${DIM}Suggested capabilities for ${AGENT_BINARY}: ${DEFAULT_CAPS}${NC}"
-  read -p "  Capabilities [${DEFAULT_CAPS}]: " AGENT_CAPS
-  AGENT_CAPS=${AGENT_CAPS:-$DEFAULT_CAPS}
 fi
 
-# Sanitize — strip characters that break JSON
+if [ "${#DETECTED_SPECS[@]}" -eq 0 ]; then
+  echo -e "  ${YELLOW}No known AI CLIs detected on PATH.${NC}"
+  echo "  You can still declare one manually via AGENT_BINARIES=<name> and re-run with --non-interactive."
+fi
+
+# --- Pick which agents to declare ------------------------------------------
+
+# AGENT_BINARIES is the v2.1 multi-agent entrypoint. Accepts a comma-separated
+# list of specs (see build_agent_json). AGENT_BINARY is the v2.0 legacy single-
+# agent fallback. If neither is set in non-interactive mode, default to every
+# detected spec.
+SELECTED_SPECS=()
+if [ -n "${AGENT_BINARIES:-}" ]; then
+  IFS=',' read -ra SELECTED_SPECS <<< "$AGENT_BINARIES"
+elif [ -n "${AGENT_BINARY:-}" ]; then
+  SELECTED_SPECS=("$AGENT_BINARY")
+elif [ "$NONINTERACTIVE" = "1" ]; then
+  if [ "${#DETECTED_SPECS[@]}" -gt 0 ]; then
+    SELECTED_SPECS=("${DETECTED_SPECS[@]}")
+  else
+    SELECTED_SPECS=("claude") # last-ditch default
+  fi
+else
+  # Interactive multi-select menu.
+  echo ""
+  echo "  Pick agents to expose (comma-separated numbers, or Enter for all detected):"
+  for i in "${!DETECTED_SPECS[@]}"; do
+    echo "    $((i+1))) ${DETECTED_SPECS[$i]}"
+  done
+  read -p "  Selection: " _picks
+  if [ -z "$_picks" ]; then
+    SELECTED_SPECS=("${DETECTED_SPECS[@]}")
+  else
+    IFS=',' read -ra _pick_arr <<< "$_picks"
+    for _p in "${_pick_arr[@]}"; do
+      _p=$(echo "$_p" | tr -d ' ')
+      # Allow free-form specs too (e.g. the user types "ollama:gemma2" directly)
+      if [[ "$_p" =~ ^[0-9]+$ ]]; then
+        _idx=$((_p-1))
+        if [ "$_idx" -ge 0 ] && [ "$_idx" -lt "${#DETECTED_SPECS[@]}" ]; then
+          SELECTED_SPECS+=("${DETECTED_SPECS[$_idx]}")
+        fi
+      elif [ -n "$_p" ]; then
+        SELECTED_SPECS+=("$_p")
+      fi
+    done
+  fi
+fi
+
+if [ "${#SELECTED_SPECS[@]}" -eq 0 ]; then
+  die "No agents selected. Set AGENT_BINARIES or AGENT_BINARY, or pick from the menu." "no-agents-selected"
+fi
+
+# Health-check every selected binary; warn but don't fail for missing ones — the
+# user might install later, and the worker reports spawn errors on first use.
+echo ""
+echo -e "  ${BOLD}Declaring:${NC}"
+for spec in "${SELECTED_SPECS[@]}"; do
+  spec=$(echo "$spec" | tr -d ' ')
+  [ -z "$spec" ] && continue
+  if [[ "$spec" == ollama:* ]]; then
+    MODEL_ID="${spec#ollama:}"
+    if command -v ollama >/dev/null 2>&1; then
+      echo -e "    ${GREEN}✓${NC} ollama-$(sanitize_model_id "$MODEL_ID") ${DIM}(model=${MODEL_ID})${NC}"
+    else
+      echo -e "    ${YELLOW}⚠${NC}  ollama-$(sanitize_model_id "$MODEL_ID") — ollama not on PATH, spawns will fail until installed"
+    fi
+  else
+    if command -v "$spec" >/dev/null 2>&1; then
+      echo -e "    ${GREEN}✓${NC} ${spec}"
+    else
+      echo -e "    ${YELLOW}⚠${NC}  ${spec} not on PATH — worker will error on spawn until installed"
+    fi
+  fi
+done
+
+# Sanitize worker-identity strings — strip chars that would break JSON encoding.
 sanitize() { echo "$1" | tr -d '"\\`$\n\r'; }
-AGENT_NAME=$(sanitize "$AGENT_NAME")
-AGENT_BINARY=$(sanitize "$AGENT_BINARY")
-AGENT_DESC=$(sanitize "$AGENT_DESC")
 WORKER_NAME=$(sanitize "$WORKER_NAME")
 WORKER_DESC=$(sanitize "$WORKER_DESC")
 
-# Build capabilities JSON array
-IFS=',' read -ra CAP_ARRAY <<< "$AGENT_CAPS"
-CAPS_JSON="["
-for i in "${!CAP_ARRAY[@]}"; do
-  cap=$(echo "${CAP_ARRAY[$i]}" | tr -d '"\\`$\n\r ' )
-  [ "$i" -gt 0 ] && CAPS_JSON="$CAPS_JSON,"
-  CAPS_JSON="$CAPS_JSON\"$cap\""
-done
-CAPS_JSON="$CAPS_JSON]"
-
-ARGS_PRESET=$(args_preset "$AGENT_BINARY")
-# Allow override via AGENT_ARGS env var (comma-separated JSON-quoted strings, e.g. '"-p","foo"').
-AGENT_ARGS="${AGENT_ARGS:-$ARGS_PRESET}"
-
-AGENTS_JSON="[{\"name\":\"${AGENT_NAME}\",\"binary\":\"${AGENT_BINARY}\",\"args\":[${AGENT_ARGS}],\"description\":\"${AGENT_DESC}\",\"capabilities\":${CAPS_JSON}}]"
+# Build the final array. Joined via commas; no trailing comma; no blanks.
+_joined=$(IFS=','; echo "${SELECTED_SPECS[*]}")
+AGENTS_JSON=$(build_agents_json "$_joined")
 
 # --- Step 6: Write .env -----------------------------------------------------
 

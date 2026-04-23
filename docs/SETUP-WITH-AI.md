@@ -120,13 +120,22 @@ Detect and report installed AI CLIs on PATH:
   for bin in claude codex ollama aider gemini bash; do
     command -v "$bin" >/dev/null 2>&1 && echo "✓ found: $bin"
   done
+If ollama is present, list downloaded models:
+  ollama list 2>/dev/null | awk 'NR>1 {print "  model: "$1}'
 
-Then run:
+Then run. In multi-agent mode, pass AGENT_BINARIES with a comma-separated
+list; use `ollama:<model>` to declare each downloaded model as a separate
+agent:
   git clone https://github.com/GuilhermeBianeck/AnyAgent.git
   cd AnyAgent
   HUB_URL="<URL>" PAIR_CODE="<CODE>" WS_SECRET="<SECRET>" \
   WORKER_NAME="<NAME>" \
+  AGENT_BINARIES="claude,codex,ollama:llama3.1:8b,ollama:gemma2:9b" \
     ./add-worker.sh --non-interactive
+
+Omit AGENT_BINARIES to take every CLI on PATH plus every ollama model
+that's already downloaded. Pass a single CLI (e.g. AGENT_BINARIES=claude)
+for the minimal case.
 
 Install as a service:
   ./packaging/install-service.sh worker

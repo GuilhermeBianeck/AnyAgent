@@ -76,20 +76,20 @@ export async function runDoctor(): Promise<number> {
 
   // 4. WORKER_AGENTS parses + each binary is on PATH
   const rawAgents = process.env.WORKER_AGENTS;
+  let declaredAgents: Array<{ name: string; binary: string; args?: string[] }> = [];
   if (!rawAgents) {
     fail('WORKER_AGENTS not set', 'the worker has nothing to expose');
     failed++;
   } else {
-    let agents: Array<{ name: string; binary: string }>;
     try {
-      agents = JSON.parse(rawAgents) as Array<{ name: string; binary: string }>;
-      ok('WORKER_AGENTS parses', `${agents.length} agent(s)`);
+      declaredAgents = JSON.parse(rawAgents) as Array<{ name: string; binary: string; args?: string[] }>;
+      ok('WORKER_AGENTS parses', `${declaredAgents.length} agent(s)`);
     } catch {
       fail('WORKER_AGENTS is not valid JSON');
       failed++;
-      agents = [];
+      declaredAgents = [];
     }
-    for (const agent of agents) {
+    for (const agent of declaredAgents) {
       // `command -v` via shell would be simpler but not portable to Windows.
       // spawnSync with `which`/`where` keeps us deterministic.
       const whichBin = process.platform === 'win32' ? 'where' : 'which';
@@ -102,6 +102,44 @@ export async function runDoctor(): Promise<number> {
         ok(`${agent.name} → ${agent.binary}`, `${path}${version ? ` — ${version}` : ''}`);
       } else {
         fail(`${agent.name} → ${agent.binary}`, 'NOT on PATH; install it before the hub asks to spawn');
+        failed++;
+      }
+    }
+
+    // 4b. If any agent uses ollama, the ollama server must be reachable.
+    // `ollama list` hits the daemon on 127.0.0.1:11434 and exits 0 when it
+    // can connect. Non-zero usually means `ollama serve` isn't running — very
+    // common failure mode where the binary is present but spawns time out.
+    const ollamaModels = declaredAgents
+      .filter(a => a.binary === 'ollama')
+      .map(a => (a.args && a.args.length > 1 ? a.args[1] : undefined))
+      .filter((m): m is string => !!m);
+    if (ollamaModels.length > 0) {
+      const probe = spawnSync('ollama', ['list'], { encoding: 'utf-8', timeout: 3000 });
+      if (probe.status === 0) {
+        const available = probe.stdout
+          .split('\n')
+          .slice(1)
+          .map(line => line.trim().split(/\s+/)[0])
+          .filter(Boolean);
+        ok('ollama server reachable', `${available.length} model(s) installed`);
+        // Cross-check every declared model is actually downloaded locally. A
+        // missing model means the first spawn will stall downloading gigabytes
+        // or fail outright — better to surface it up front.
+        for (const model of ollamaModels) {
+          if (available.includes(model)) {
+            ok(`  ollama model ready`, model);
+          } else {
+            warn(`  ollama model not downloaded`, `run: ollama pull ${model}`);
+          }
+        }
+      } else {
+        // spawnSync's error.code is not in the base Error typings
+        const errCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;
+        const hint = errCode === 'ENOENT'
+          ? 'ollama binary missing'
+          : 'is `ollama serve` running? (brew services start ollama, or `ollama serve &`)';
+        fail('ollama server unreachable', hint);
         failed++;
       }
     }
