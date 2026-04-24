@@ -352,3 +352,30 @@ Multi-step tasks across agents. Design constraint: task schema supports `parent_
 | Failure handling | Silent exit | Error detail + manual retry button |
 | Busy handling | Undefined | Task queue (FIFO, cap 3) |
 | Status | Pull (`/status` command) | Push (pinned auto-updating message) |
+
+---
+
+## Appendix: v2.1 — Agent Identity (Shipped 2026-04-23)
+
+Post-v2.0, fleet displays collapsed to flat names whenever two machines declared the same agent (e.g. both Macs running `claude`). The underlying `(name, node_id)` DB uniqueness was already correct — the v2.1 work propagates that uniqueness through every display and addressing surface. See [AGENT-IDENTITY-PLAN.md](./AGENT-IDENTITY-PLAN.md) for the full design.
+
+### Delta vs. v2.0
+
+| Surface | v2.0 | v2.1 |
+|---------|------|------|
+| Display handle | `claude` | `claude@spot` — `node_alias` derived from hostname (`Spot.local` → `spot`), stored on `nodes.alias`, de-duped with `-2`/`-3` |
+| MCP tools | `anyagent_<name>` only | `anyagent_<name>` (short, hub picks) + `anyagent_<name>_<alias>` (explicit, targets one node) |
+| Short-form pick | `WHERE name = ?` (undefined winner) | `resolveShortFormAgent`: online first, tie-break by `agents.created_at ASC`, every decision logged at `[router]` |
+| `anyagent_list_agents` | Flat list | Grouped by node; footer documents both tool forms |
+| Telegram | `/agents` flat | `/agents` grouped + `/nodes` machine view + `/call <name>@<alias>` explicit form |
+| Pinned status | Worker online/total | Per-node agent count alongside online state |
+| Installer | One agent per `add-worker.sh` run | `AGENT_BINARIES=claude,codex,ollama:llama3.1` declares many in one pass; multi-select UI when interactive |
+| Local LLMs | Not covered | `ollama:<model>` first-class; `args_preset_ollama` emits `["run","<model>"]`; doctor probes `ollama list` |
+| Collision on declare | Silent overwrite | Non-blocking `[gateway]` warning listing every other online node with the same name |
+| Task response | `"Task <id> started on claude."` | `"Task <id> started on claude@spot."` — `TaskStartResult.nodeAlias` flows through MCP, Telegram, and CLI renders |
+
+### Impact on v2.0 requirements
+
+- **P0-3 (MCP Server Mode).** Tool registry now emits two tool names per `(name, node_alias)` pair. Short form remains the primary tool a client sees; explicit form exists for the multi-machine case.
+- **P0-5 (Capability-Based Routing).** Rule 4 (intent keywords vs. capabilities) unchanged. Rule 2 ("only one agent online") gains a documented tie-break when the fleet has multiple nodes with that name: online → `created_at ASC`.
+- **P2-2 (Multi-User with Roles).** Still open; node aliasing is orthogonal — machines, not users.
