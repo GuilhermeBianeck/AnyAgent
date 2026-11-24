@@ -27,6 +27,7 @@ export type EventType =
   | 'task.submitted'
   | 'task.complete'
   | 'task.failed'
+  | 'task.cancelled'
   | 'hub.started'
   | 'hub.stopped';
 

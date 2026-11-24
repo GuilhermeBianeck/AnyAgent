@@ -8,11 +8,48 @@ import { ADMIN_SCOPE, resolveBearer, scopeAllows, scopeAllowsAnyNode, type Token
 import type { AgentRow } from './types.js';
 import {
   findAgentByCapability, createTaskId, startAgentForTask,
-  getAgentList, getWorkerList, resolveShortFormAgent,
+  getAgentList, getWorkerList, resolveShortFormAgent, cancelTask,
 } from './manager.js';
 import { getContext } from './context.js';
-import type { TaskRow } from './types.js';
+import type { TaskRow, OutputParams } from './types.js';
+import { isTerminalStatus } from './types.js';
 import { insertTask } from './db.js';
+import { onStructuredOutput } from './gateway.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sdk/types.js';
+
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+type ProgressFn = (message: string) => void;
+
+/**
+ * MCP progress notifications for a call, if the client asked for them by
+ * sending a progressToken. The spec requires `progress` to strictly increase,
+ * so it counts updates; the human-readable state goes in `message`.
+ */
+function progressReporter(extra: ToolExtra | undefined): ProgressFn | undefined {
+  const token = extra?._meta?.progressToken;
+  if (token === undefined || !extra) return undefined;
+  let seq = 0;
+  return (message: string) => {
+    extra.sendNotification({
+      method: 'notifications/progress',
+      params: { progressToken: token, progress: ++seq, message },
+    }).catch(() => { /* client went away */ });
+  };
+}
+
+function describeOutput(p: OutputParams): string | undefined {
+  if (p.type === 'status') {
+    const text = (p.payload as { text?: string }).text;
+    return text || undefined;
+  }
+  if (p.type === 'progress') {
+    const { current = 0, total, label } = p.payload as { current?: number; total?: number; label?: string };
+    const pct = total ? ` (${Math.round((current / total) * 100)}%)` : '';
+    return `${current}/${total ?? '?'}${pct}${label ? ` — ${label}` : ''}`;
+  }
+  return undefined;
+}
 import { getBuildInfo, uptimeSeconds } from './build-info.js';
 import { metricsEnabled, renderMetrics, setWorkersOnline } from './metrics.js';
 import { recordMcpCall } from './audit.js';
@@ -42,10 +79,34 @@ const RUNS_AGENT: ToolAnnotations = {
 const timeoutParam = z.number().int().min(0).max(120000).optional()
   .describe('Block up to this many ms (max 120000) waiting for the result. Omit for async; poll with anyagent_task_status.');
 
+// Task lifecycle in the MCP Tasks extension's vocabulary (SEP-2663), so
+// clients that understand Tasks can treat AnyAgent handles the same way.
+export type McpTaskStatus = 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
+
+export function toMcpTaskStatus(status: string): McpTaskStatus {
+  switch (status) {
+    case 'complete': return 'completed';
+    case 'failed':
+    case 'timeout': return 'failed';
+    case 'cancelled': return 'cancelled';
+    case 'pending_approval': return 'input_required'; // waiting on the operator
+    default: return 'working'; // submitted | routed | queued | running
+  }
+}
+
+/** Suggested poll interval for non-terminal tasks. */
+export const POLL_INTERVAL_MS = 2_000;
+/** Tasks are kept for 30 days (cleanOldTasks), so handles stay valid that long. */
+export const TASK_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 // Shape shared by every tool that creates or reports on a task.
 const taskOutputShape = {
   taskId: z.string(),
-  status: z.string().describe('submitted | pending_approval | queued | routed | running | complete | failed | timeout'),
+  status: z.string().describe('AnyAgent status: submitted | pending_approval | queued | routed | running | complete | failed | timeout | cancelled'),
+  taskStatus: z.enum(['working', 'input_required', 'completed', 'failed', 'cancelled'])
+    .describe('Same state in MCP Tasks vocabulary'),
+  pollIntervalMs: z.number().optional().describe('Suggested delay before polling anyagent_task_status again (non-terminal tasks only)'),
+  ttlMs: z.number().describe('How long this task id stays queryable'),
   agent: z.string().optional(),
   node: z.string().optional().describe('Alias of the machine the task runs on'),
   intent: z.string().optional(),
@@ -58,6 +119,9 @@ const taskOutputShape = {
 type TaskOutput = {
   taskId: string;
   status: string;
+  taskStatus: McpTaskStatus;
+  pollIntervalMs?: number;
+  ttlMs: number;
   agent?: string;
   node?: string;
   intent?: string;
@@ -85,10 +149,19 @@ function compact<T extends Record<string, unknown>>(obj: T): T {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T;
 }
 
+function handle(taskId: string, status: string): Pick<TaskOutput, 'taskId' | 'status' | 'taskStatus' | 'pollIntervalMs' | 'ttlMs'> {
+  return {
+    taskId,
+    status,
+    taskStatus: toMcpTaskStatus(status),
+    pollIntervalMs: isTerminalStatus(status) ? undefined : POLL_INTERVAL_MS,
+    ttlMs: TASK_TTL_MS,
+  };
+}
+
 export function taskToOutput(task: TaskRow): TaskOutput {
   return compact({
-    taskId: task.task_id,
-    status: task.status,
+    ...handle(task.task_id, task.status),
     agent: task.agent_name ?? undefined,
     node: nodeAliasFor(task.node_id),
     intent: task.intent,
@@ -117,7 +190,7 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const task = getTask(taskId);
-    if (task && (task.status === 'complete' || task.status === 'failed' || task.status === 'timeout')) {
+    if (task && isTerminalStatus(task.status)) {
       return task;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
@@ -139,7 +212,15 @@ function aliasOf(agent: AgentRow): string {
   return nodeAliasFor(agent.node_id) ?? agent.node_id.replace(/^node_/, '').slice(0, 8);
 }
 
-async function handleToolCall(scope: TokenScope, agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<ToolResult> {
+/** Why a scoped token may not see/act on this task, or undefined if it may. */
+function taskOutOfScope(scope: TokenScope, task: TaskRow): string | undefined {
+  if (scope.agents === '*') return undefined;
+  const alias = nodeAliasFor(task.node_id) ?? '';
+  if (task.agent_name && scopeAllows(scope, task.agent_name, alias)) return undefined;
+  return `out of scope: ${task.agent_name ?? 'unrouted'}@${alias}`;
+}
+
+async function handleToolCall(scope: TokenScope, agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string; progress?: ProgressFn }): Promise<ToolResult> {
   const { getAgentByNameAndAlias } = await import('./db.js');
   // If the caller targeted a specific node via `anyagent_<name>_<alias>`, resolve
   // it that way — never collapse the collision to some other node.
@@ -174,7 +255,7 @@ async function handleToolCall(scope: TokenScope, agentName: string, intent: stri
     const t = getTask(taskId);
     return t
       ? taskToOutput(t)
-      : { taskId, status: 'failed', agent: result.agentName, node: result.nodeAlias };
+      : compact({ ...handle(taskId, 'failed'), agent: result.agentName, node: result.nodeAlias });
   };
 
   if (result.outcome === 'failed' || result.outcome === 'offline' || result.outcome === 'queue_full') {
@@ -183,12 +264,37 @@ async function handleToolCall(scope: TokenScope, agentName: string, intent: stri
 
   // Blocking mode
   if (timeoutMs && timeoutMs > 0) {
-    const completed = await waitForTask(taskId, timeoutMs);
     const ranOn = result.nodeAlias ? ` (${result.agentName}@${result.nodeAlias})` : '';
+    // Relay the worker's status/progress output as MCP progress notifications
+    // while we wait. Besides informing the user, progress lets clients that
+    // reset their request timeout on progress keep long calls alive.
+    const progress = options?.progress;
+    let unsubscribe: (() => void) | undefined;
+    if (progress) {
+      progress(result.outcome === 'queued'
+        ? `Queued on ${result.agentName}@${result.nodeAlias} (position ${result.queuePosition ?? '?'})`
+        : result.outcome === 'pending_approval'
+        ? `Waiting for operator approval for ${result.agentName}@${result.nodeAlias}`
+        : `Started on ${result.agentName}@${result.nodeAlias}`);
+      unsubscribe = onStructuredOutput((_nodeId, p) => {
+        if (p.taskId !== taskId) return;
+        const msg = describeOutput(p);
+        if (msg) progress(msg);
+      });
+    }
+    let completed: TaskRow | null;
+    try {
+      completed = await waitForTask(taskId, timeoutMs);
+    } finally {
+      unsubscribe?.();
+    }
     if (completed) {
       const out = taskToOutput(completed);
       if (completed.status === 'complete') {
         return textResult(completed.result_summary ?? `Task completed${ranOn}.`, out);
+      }
+      if (completed.status === 'cancelled') {
+        return textResult(`Task cancelled${ranOn}.`, out, true);
       }
       return textResult(`Task failed${ranOn}: ${completed.error ?? 'unknown'}`, out, true);
     }
@@ -247,21 +353,28 @@ class ToolRegistry {
   }
 
   /** Wrap a tool handler so every call is timed and recorded. */
-  handler<A>(tool: string, fn: (args: A) => Promise<ToolResult>): (args: A) => Promise<ToolResult> {
-    return async (args: A) => {
-      const started = Date.now();
-      let result: ToolResult | undefined;
-      try {
-        result = await fn(args);
-        return result;
-      } finally {
-        recordMcpCall({
-          tool, token: this.ctx.token, args, result, threw: result === undefined,
-          denied: result ? deniedResults.get(result) : undefined,
-          durationMs: Date.now() - started,
-        });
-      }
-    };
+  handler<A>(tool: string, fn: (args: A, extra: ToolExtra) => Promise<ToolResult>): (args: A, extra: ToolExtra) => Promise<ToolResult> {
+    return async (args: A, extra: ToolExtra) => this.audited(tool, args, () => fn(args, extra));
+  }
+
+  /** Same, for tools without an input schema (the SDK passes only `extra`). */
+  handlerNoArgs(tool: string, fn: (extra: ToolExtra) => Promise<ToolResult>): (extra: ToolExtra) => Promise<ToolResult> {
+    return async (extra: ToolExtra) => this.audited(tool, {}, () => fn(extra));
+  }
+
+  private async audited(tool: string, args: unknown, run: () => Promise<ToolResult>): Promise<ToolResult> {
+    const started = Date.now();
+    let result: ToolResult | undefined;
+    try {
+      result = await run();
+      return result;
+    } finally {
+      recordMcpCall({
+        tool, token: this.ctx.token, args, result, threw: result === undefined,
+        denied: result ? deniedResults.get(result) : undefined,
+        durationMs: Date.now() - started,
+      });
+    }
   }
 }
 
@@ -288,7 +401,7 @@ function registerStaticTools(reg: ToolRegistry): void {
         })),
       },
     },
-    reg.handler('anyagent_list_agents', async () => {
+    reg.handlerNoArgs('anyagent_list_agents', async () => {
       const agents = getAgentList().filter(a => scopeAllows(scope, a.name, a.nodeAlias));
       const structured = {
         agents: agents.map(a => ({
@@ -355,7 +468,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       },
       outputSchema: taskOutputShape,
     },
-    reg.handler('anyagent_route', async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
+    reg.handler('anyagent_route', async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }, extra) => {
       // Only agents this token may call are candidates.
       const routing = findAgentByCapability(intent, a => scopeAllows(scope, a.name, aliasOf(a)));
       if (routing.type === 'none') {
@@ -368,7 +481,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       }
       // Pin to the machine routing chose, so short-form resolution cannot
       // move the task to a same-named agent elsewhere.
-      return handleToolCall(scope, agent.name, intent, timeout_ms, 'matched', { explicitAlias: aliasOf(agent) });
+      return handleToolCall(scope, agent.name, intent, timeout_ms, 'matched', { explicitAlias: aliasOf(agent), progress: progressReporter(extra) });
     })
   );
   }
@@ -390,12 +503,8 @@ function registerStaticTools(reg: ToolRegistry): void {
       }
       // A scoped token must not read results of agents it cannot call. Answer
       // "not found" rather than confirming the task exists.
-      if (scope.agents !== '*') {
-        const alias = nodeAliasFor(task.node_id) ?? '';
-        if (!task.agent_name || !scopeAllows(scope, task.agent_name, alias)) {
-          return deniedResult(`Task ${task_id} not found.`, `out of scope: ${task.agent_name ?? 'unrouted'}@${alias}`);
-        }
-      }
+      const outOfScope = taskOutOfScope(scope, task);
+      if (outOfScope) return deniedResult(`Task ${task_id} not found.`, outOfScope);
       // Surface WHICH machine the task ran on so the operator knows which
       // worker to look at for logs, CLI state, etc. when they didn't pick.
       const out = taskToOutput(task);
@@ -407,6 +516,30 @@ function registerStaticTools(reg: ToolRegistry): void {
     })
   );
 
+  if (!scope.readonly) {
+    reg.claim('anyagent_task_cancel');
+    server.registerTool(
+      'anyagent_task_cancel',
+      {
+        title: 'Cancel task',
+        description: 'Cancel a queued, pending or running task. A running task\'s process is stopped on its worker.',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        inputSchema: { task_id: z.string().describe('The task ID to cancel') },
+        outputSchema: taskOutputShape,
+      },
+      reg.handler('anyagent_task_cancel', async ({ task_id }: { task_id: string }) => {
+        const task = getTask(task_id);
+        if (!task) return textResult(`Task ${task_id} not found.`, undefined, true);
+        const outOfScope = taskOutOfScope(scope, task);
+        if (outOfScope) return deniedResult(`Task ${task_id} not found.`, outOfScope);
+        const res = cancelTask(task_id, `mcp:${scope.token}`);
+        const out = taskToOutput(res.task ?? task);
+        if (!res.ok) return textResult(`Cannot cancel ${task_id}: ${res.reason}.`, out, true);
+        return textResult(`Task ${task_id} cancelled${res.killed ? '; its process was stopped' : ''}.`, out);
+      })
+    );
+  }
+
   reg.claim('anyagent_context');
   server.registerTool(
     'anyagent_context',
@@ -416,7 +549,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       annotations: READ_ONLY,
       outputSchema: { context: z.string() },
     },
-    reg.handler('anyagent_context', async () => {
+    reg.handlerNoArgs('anyagent_context', async () => {
       const ctx = getContext();
       return textResult(ctx || 'No operator context set.', { context: ctx ?? '' });
     })
@@ -463,8 +596,8 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         },
         outputSchema: taskOutputShape,
       },
-      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
-        return handleToolCall(scope, name, intent, timeout_ms, 'explicit');
+      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }, extra) => {
+        return handleToolCall(scope, name, intent, timeout_ms, 'explicit', { progress: progressReporter(extra) });
       })
     );
   }
@@ -491,8 +624,8 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         },
         outputSchema: taskOutputShape,
       },
-      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
-        return handleToolCall(scope, a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
+      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }, extra) => {
+        return handleToolCall(scope, a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias, progress: progressReporter(extra) });
       })
     );
   }

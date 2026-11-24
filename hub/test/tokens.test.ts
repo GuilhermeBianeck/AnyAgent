@@ -46,20 +46,22 @@ test('only the hash is stored; the plaintext resolves to its scope', () => {
 test('admin token sees every tool', async () => {
   assert.deepEqual(await toolNames('admin-secret'), [
     'anyagent_claude', 'anyagent_claude_gpu', 'anyagent_claude_laptop', 'anyagent_context',
-    'anyagent_list_agents', 'anyagent_route', 'anyagent_shell', 'anyagent_shell_gpu', 'anyagent_task_status',
+    'anyagent_list_agents', 'anyagent_route', 'anyagent_shell', 'anyagent_shell_gpu',
+    'anyagent_task_cancel', 'anyagent_task_status',
   ]);
 });
 
 test('a name@alias token gets only that explicit tool — no short form the hub could re-route', async () => {
   assert.deepEqual(await toolNames(laptopOnly), [
-    'anyagent_claude_laptop', 'anyagent_context', 'anyagent_list_agents', 'anyagent_route', 'anyagent_task_status',
+    'anyagent_claude_laptop', 'anyagent_context', 'anyagent_list_agents', 'anyagent_route',
+    'anyagent_task_cancel', 'anyagent_task_status',
   ]);
 });
 
 test('a bare-name token gets the short form and every machine for that name', async () => {
   assert.deepEqual(await toolNames(claudeAny), [
     'anyagent_claude', 'anyagent_claude_gpu', 'anyagent_claude_laptop', 'anyagent_context',
-    'anyagent_list_agents', 'anyagent_route', 'anyagent_task_status',
+    'anyagent_list_agents', 'anyagent_route', 'anyagent_task_cancel', 'anyagent_task_status',
   ]);
 });
 

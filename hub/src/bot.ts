@@ -9,6 +9,7 @@ import {
   getApprovalMode, setApprovalMode, purgeTasksByChatId,
   getActiveSession, resolveTaskAgent,
   listPendingReviews, approvePendingAgent, type PendingReview,
+  cancelTask,
 } from './manager.js';
 import { onEvent } from './events.js';
 import { randomBytes } from 'crypto';
@@ -123,6 +124,8 @@ function statusEmoji(status: TaskStatus): string {
     case 'complete': return '✅';
     case 'failed': return '❌';
     case 'timeout': return '⏰';
+    case 'cancelled': return '🚫';
+    case 'pending_approval': return '🛂';
     default: return '❓';
   }
 }
@@ -1089,12 +1092,14 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     if (!guardUser(ctx, allowedUserId)) return;
     const taskId = ctx.match[1];
     const task = getTask(taskId);
+    // This button lives on the "queued" message — don't kill a task that has
+    // started since; the user can still stop it with /stop.
     if (!task || task.status !== 'queued') {
       await ctx.answerCallbackQuery({ text: 'Task not found or already started.' });
       return;
     }
-    updateTaskStatus(taskId, 'failed', { error: 'Cancelled by user' });
-    await ctx.editMessageText('❌ Queued task cancelled.');
+    cancelTask(taskId, 'operator');
+    await ctx.editMessageText('🚫 Queued task cancelled.');
     await ctx.answerCallbackQuery({ text: 'Cancelled.' });
   });
 

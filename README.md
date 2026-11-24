@@ -185,9 +185,12 @@ Every registered agent becomes an MCP tool. Plus these built-in tools:
 | `anyagent_<name>` | `intent`, `timeout_ms?` | Call a specific agent directly. One tool per registered agent. |
 | `anyagent_list_agents` | — | List all agents with capabilities and online/offline status. |
 | `anyagent_task_status` | `task_id` | Check task progress and result by ID. |
+| `anyagent_task_cancel` | `task_id` | Cancel a queued, pending or running task. A running process is stopped on its worker. |
 | `anyagent_context` | — | Read the operator's persistent context notes. |
 
-**Blocking mode:** Set `timeout_ms` to wait for the result inline. Without it, tool calls return a `task_id` for polling via `anyagent_task_status`.
+**Blocking mode:** Set `timeout_ms` to wait for the result inline. Without it, tool calls return a `task_id` for polling via `anyagent_task_status`. If the client sends a `progressToken`, the worker's status and progress updates arrive as MCP progress notifications while it waits.
+
+**Structured results:** Every tool declares an `outputSchema` and returns `structuredContent` alongside the text. Task results carry `taskId`, `status`, the same state in MCP Tasks vocabulary (`taskStatus`: `working` / `input_required` / `completed` / `failed` / `cancelled`), `pollIntervalMs` while unfinished, `ttlMs`, and the `agent` and `node` that ran it. Tools are annotated (`readOnlyHint`, `destructiveHint`, `openWorldHint`), so clients can skip confirmation for read-only calls and ask before running an agent.
 
 ---
 

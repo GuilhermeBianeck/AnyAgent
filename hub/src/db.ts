@@ -11,6 +11,7 @@ import { mkdirSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import type { NodeRow, PairCodeRow, AgentRow, SessionRow, DefaultAgentRow, TaskRow, TaskStatus, TaskSource, RoutingMethod } from './types.js';
+import { TERMINAL_TASK_STATUSES } from './types.js';
 import { incTask } from './metrics.js';
 import { emit as emitEvent } from './events.js';
 import { dataDir as resolveDataDir } from './paths.js';
@@ -564,7 +565,7 @@ export function getTask(taskId: string): TaskRow | undefined {
   return db.prepare(`SELECT * FROM tasks WHERE task_id = ?`).get(taskId) as TaskRow | undefined;
 }
 
-const TERMINAL_STATUSES: TaskStatus[] = ['complete', 'failed', 'timeout'];
+const TERMINAL_STATUSES = TERMINAL_TASK_STATUSES;
 
 export function updateTaskStatus(taskId: string, status: TaskStatus, extra?: { agent_name?: string; node_id?: string; routing_method?: RoutingMethod; result_summary?: string; error?: string }): void {
   const sets = [`status = ?`, `updated_at = datetime('now')`];
@@ -584,6 +585,8 @@ export function updateTaskStatus(taskId: string, status: TaskStatus, extra?: { a
     incTask(status, source);
     if (status === 'complete') {
       emitEvent('task.complete', { task_id: taskId });
+    } else if (status === 'cancelled') {
+      emitEvent('task.cancelled', { task_id: taskId, detail: extra?.error });
     } else {
       emitEvent('task.failed', { task_id: taskId, detail: extra?.error });
     }

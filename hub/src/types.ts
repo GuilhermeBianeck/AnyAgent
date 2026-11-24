@@ -114,7 +114,13 @@ export interface AgentRow {
 }
 
 // Task row (v2)
-export type TaskStatus = 'submitted' | 'pending_approval' | 'queued' | 'routed' | 'running' | 'complete' | 'failed' | 'timeout';
+export type TaskStatus = 'submitted' | 'pending_approval' | 'queued' | 'routed' | 'running' | 'complete' | 'failed' | 'timeout' | 'cancelled';
+
+export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['complete', 'failed', 'timeout', 'cancelled'];
+
+export function isTerminalStatus(status: string): boolean {
+  return (TERMINAL_TASK_STATUSES as readonly string[]).includes(status);
+}
 export type TaskSource = 'telegram' | 'mcp' | 'cli';
 export type RoutingMethod = 'default' | 'single' | 'matched' | 'explicit' | 'user_selected';
 
