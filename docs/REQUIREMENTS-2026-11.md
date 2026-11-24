@@ -30,67 +30,67 @@ Effort: **S** < 1 day, **M** 1–3 days, **L** > 3 days.
 
 ### AR-0 — Automated tests and CI *(enabler)*
 The repo has no automated tests, so security work cannot be shipped credibly without regression coverage.
-- [ ] `npm test` in `hub/` runs `node:test` suites via `tsx`, each run against an isolated `ANYAGENT_HUB_DIR`.
-- [ ] `tsconfig.json` compiles `src/` only, so tests never land in `dist/`.
-- [ ] `.github/workflows/ci.yml` builds hub, sdk and worker and runs hub tests on every push and PR.
+- [x] `npm test` in `hub/` runs `node:test` suites via `tsx`, each run against an isolated `ANYAGENT_HUB_DIR`.
+- [x] `tsconfig.json` compiles `src/` only, so tests never land in `dist/`.
+- [x] `.github/workflows/ci.yml` builds hub, sdk and worker and runs hub tests on every push and PR.
 
 **P0 · S**
 
 ### AR-1 — Spec-current MCP tool metadata *(T8)*
-- [ ] Every tool has a human `title` and `annotations`. Status/list/context tools: `readOnlyHint: true`. Agent and route tools: `destructiveHint: true, openWorldHint: true`.
-- [ ] `anyagent_list_agents`, `anyagent_task_status`, `anyagent_route` and the agent tools declare an `outputSchema` and return matching `structuredContent`, alongside the existing text content for older clients.
+- [x] Every tool has a human `title` and `annotations`. Status/list/context tools: `readOnlyHint: true`. Agent and route tools: `destructiveHint: true, openWorldHint: true`.
+- [x] `anyagent_list_agents`, `anyagent_task_status`, `anyagent_route` and the agent tools declare an `outputSchema` and return matching `structuredContent`, alongside the existing text content for older clients.
 
 **P0 · S**
 
 ### AR-2 — Sanitize worker-declared metadata *(T3)*
-- [ ] On `declare`, agent names must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. Agents that fail are rejected and logged.
-- [ ] Descriptions are stripped of control, zero-width and bidi-override characters, whitespace is collapsed, and length is capped (300 chars).
-- [ ] Capabilities are lower-cased, restricted to `[a-z0-9_-]`, max 32 chars each, max 16 items. Node name and description get the same treatment.
-- [ ] Every change made by sanitization emits a `worker.metadata_sanitized` event.
+- [x] On `declare`, agent names must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. Agents that fail are rejected and logged.
+- [x] Descriptions are stripped of control, zero-width and bidi-override characters, whitespace is collapsed, and length is capped (300 chars).
+- [x] Capabilities are lower-cased, restricted to `[a-z0-9_-]`, max 32 chars each, max 16 items. Node name and description get the same treatment.
+- [x] Every change made by sanitization emits a `worker.metadata_sanitized` event.
 
 **P0 · S**
 
 ### AR-3 — Agent definition pinning (rug-pull protection) *(T3)*
-- [ ] Each agent's definition (binary, args, description, capabilities, context-aware flag) is hashed (SHA-256) and pinned on first sight (trust on first use).
-- [ ] If a later `declare` changes the hash, the agent is **quarantined**: hidden from MCP `tools/list`, routing and `/agents`, until the operator approves it with CLI `review` or Telegram `/review`. Quarantine emits `agent.quarantined`.
-- [ ] `AGENT_REVIEW=changes` (default) quarantines changed definitions only. `all` also quarantines new agents. `off` restores the previous behaviour.
-- [ ] Re-declaring an unchanged definition preserves `trusted` and `created_at` (fixes reconnect churn).
-- [ ] Trust is per `(name, node)`. Trusting `claude@laptop` no longer trusts `claude@other`.
+- [x] Each agent's definition (binary, args, description, capabilities, context-aware flag) is hashed (SHA-256) and pinned on first sight (trust on first use).
+- [x] If a later `declare` changes the hash, the agent is **quarantined**: hidden from MCP `tools/list`, routing and `/agents`, until the operator approves it with CLI `review` or Telegram `/review`. Quarantine emits `agent.quarantined`.
+- [x] `AGENT_REVIEW=changes` (default) quarantines changed definitions only. `all` also quarantines new agents. `off` restores the previous behaviour.
+- [x] Re-declaring an unchanged definition preserves `trusted` and `created_at` (fixes reconnect churn).
+- [x] Trust is per `(name, node)`. Trusting `claude@laptop` no longer trusts `claude@other`.
 
 **P0 · M**
 
 ### AR-4 — MCP audit trail *(T4)*
-- [ ] Every MCP tool call emits an `mcp.call` event with tool name, resolved `agent@node`, token label, task id, outcome, duration, and a SHA-256 prefix of the intent. Intent text is not logged by default (privacy-first); `AUDIT_LOG_INTENT=1` opts in.
-- [ ] CLI `audit [n]` prints recent MCP calls.
+- [x] Every MCP tool call emits an `mcp.call` event with tool name, resolved `agent@node`, token label, task id, outcome, duration, and a SHA-256 prefix of the intent. Intent text is not logged by default (privacy-first); `AUDIT_LOG_INTENT=1` opts in.
+- [x] CLI `audit [n]` prints recent MCP calls.
 
 **P1 · S**
 
 ### AR-5 — Scoped MCP tokens *(T4)*
-- [ ] Named tokens are stored as SHA-256 hashes in SQLite. The plaintext is shown once, at creation.
-- [ ] Each token has an agent allowlist (`*` or names) and an optional read-only scope.
-- [ ] `tools/list` shows only what the token may call, and calls outside scope are refused.
-- [ ] CLI: `token create <label> [--agents a,b] [--readonly]`, `token list`, `token revoke <label>`.
-- [ ] `MCP_TOKEN` keeps working as the full-access admin token. The MCP server starts if `MCP_TOKEN` is set **or** any scoped token exists.
+- [x] Named tokens are stored as SHA-256 hashes in SQLite. The plaintext is shown once, at creation.
+- [x] Each token has an agent allowlist (`*` or names) and an optional read-only scope.
+- [x] `tools/list` shows only what the token may call, and calls outside scope are refused.
+- [x] CLI: `token create <label> [--agents a,b] [--readonly]`, `token list`, `token revoke <label>`.
+- [x] `MCP_TOKEN` keeps working as the full-access admin token. The MCP server starts if `MCP_TOKEN` is set **or** any scoped token exists.
 
 **P1 · M**
 
 ### AR-6 — Task handles aligned with MCP Tasks *(T2)*
-- [ ] Async responses return a structured handle: `{ taskId, status, pollIntervalMs, ttlMs }`, using the extension's vocabulary (`working`, `input_required`, `completed`, `failed`, `cancelled`).
-- [ ] New `anyagent_task_cancel` tool cancels queued, pending-approval or running tasks. Running tasks are killed on the worker.
-- [ ] New first-class `cancelled` task status across the DB, CLI and Telegram.
-- [ ] During blocking calls, worker `status`/`progress` output is relayed as `notifications/progress` when the client supplied a `progressToken`.
+- [x] Async responses return a structured handle: `{ taskId, status, pollIntervalMs, ttlMs }`, using the extension's vocabulary (`working`, `input_required`, `completed`, `failed`, `cancelled`).
+- [x] New `anyagent_task_cancel` tool cancels queued, pending-approval or running tasks. Running tasks are killed on the worker.
+- [x] New first-class `cancelled` task status across the DB, CLI and Telegram.
+- [x] During blocking calls, worker `status`/`progress` output is relayed as `notifications/progress` when the client supplied a `progressToken`.
 
 **P1 · M**
 
 ### AR-7 — MCP 2026-07-28 dual-stack *(T1)*
-- [ ] Serve 2026-07-28 clients (stateless, `server/discover`, header routing, `ttlMs` on lists) while keeping 2025-11-25 clients working, via `@modelcontextprotocol/server` v2 `createMcpHandler` + legacy fallback.
+- [x] Serve 2026-07-28 clients (stateless, `server/discover`, header routing, `ttlMs` on lists) while keeping 2025-11-25 clients working, via `@modelcontextprotocol/server` v2 `createMcpHandler` + legacy fallback.
 - [ ] Native `io.modelcontextprotocol/tasks` extension backed by the AR-6 task model.
 
 **P1 · L** — depends on AR-1 and AR-6 (tool definitions and task model ported once).
 
 ### AR-8 — A2A Agent Card + minimal A2A binding *(T5)*
-- [ ] With `A2A_ENABLED=1`, the hub serves `/.well-known/agent-card.json` in A2A v1.0 shape (`supportedInterfaces`, `capabilities`, `securitySchemes`, one skill per agent). Quarantined agents are excluded.
-- [ ] Minimal JSON-RPC binding (`SendMessage`, `GetTask`, `CancelTask`) mapped onto the hub's task model and protected by the same bearer tokens.
+- [x] With `A2A_ENABLED=1`, the hub serves `/.well-known/agent-card.json` in A2A v1.0 shape (`supportedInterfaces`, `capabilities`, `securitySchemes`, one skill per agent). Quarantined agents are excluded.
+- [x] Minimal JSON-RPC binding (`SendMessage`, `GetTask`, `CancelTask`) mapped onto the hub's task model and protected by the same bearer tokens.
 
 **P2 · M**
 
@@ -100,8 +100,8 @@ The repo has no automated tests, so security work cannot be shipped credibly wit
 **P2 · S**
 
 ### AR-10 — Refresh positioning *(T7)*
-- [ ] Update `MARKET-COMPARISON.md` for the November 2026 landscape (Anthropic multi-machine, OpenClaw MCP mode, governance gateways).
-- [ ] Sync `ROADMAP.md` checkboxes with what has shipped, and link this document.
+- [x] Update `MARKET-COMPARISON.md` for the November 2026 landscape (Anthropic multi-machine, OpenClaw MCP mode, governance gateways).
+- [x] Sync `ROADMAP.md` checkboxes with what has shipped, and link this document.
 
 **P1 · S**
 
@@ -117,21 +117,25 @@ The repo has no automated tests, so security work cannot be shipped credibly wit
 6. AR-10: docs.
 7. AR-7: the largest change. Last, so it ports finished tool definitions instead of moving targets.
 
-## 4. Status
+## 4. Status (2026-11-24)
 
-| ID | Status |
-|---|---|
-| AR-0 | planned |
-| AR-1 | planned |
-| AR-2 | planned |
-| AR-3 | planned |
-| AR-4 | planned |
-| AR-5 | planned |
-| AR-6 | planned |
-| AR-7 | planned |
-| AR-8 | planned |
-| AR-9 | planned |
-| AR-10 | planned |
+| ID | Status | Notes |
+|---|---|---|
+| AR-0 | ✅ done | `npm test` (node:test + tsx, isolated data dir per file), `ci.yml`. The first tests exposed two schema-migration bugs affecting every install (fresh hubs could not create tasks; same-named agents on two machines failed). Both are fixed. |
+| AR-1 | ✅ done | Also fixed an outage where an agent/node name clash made `tools/list` fail for every client. |
+| AR-2 | ✅ done | Also strips Unicode tag characters ("ASCII smuggling"). Cannot judge plain-prose instructions; AR-3 covers that. |
+| AR-3 | ✅ done | Also fixed: reconnects reset trust and pairing age; trust was per name, not per machine; queued and approved tasks could run on a different machine than intended. |
+| AR-4 | ✅ done | **Changed:** calls go to a separate `logs/audit.log`, not `events.log`, so frequent MCP calls do not flood the worker-event buffer. Also adds a Prometheus counter. |
+| AR-5 | ✅ done | Also fixed: `anyagent_route` could run its chosen agent on a different machine. |
+| AR-6 | ✅ done | Also guards the late-`exit`/late-`result` races when cancelling a running task. |
+| AR-7 | 🟡 partial | Dual-stack done (v2 SDK: 2026-07-28 natively, older clients via the stateless fallback; bundle verified). **Remaining:** the native `io.modelcontextprotocol/tasks` extension (`tasks/get`, `tasks/update`, `tasks/cancel`). |
+| AR-8 | ✅ done | Tested against the official `@a2a-js/sdk` client. |
+| AR-9 | ⛔ blocked | The SEP-2127 schema could not be verified from the build environment (`modelcontextprotocol.io` blocked), and no official schema package exists. Not implemented rather than guessed; revisit when the SEP stabilises. |
+| AR-10 | ✅ done | `MARKET-COMPARISON.md` and `ROADMAP.md` updated. |
+
+Hub tests: 77 across 11 files, covering both MCP protocol eras, A2A via the official SDK, and scripted workers over the real gateway.
+
+**Follow-up found during this work (not fixed here):** a custom SDK worker that sends a structured `result` and then exits can have its exit applied to the next queued task. The default PTY worker is unaffected.
 
 ## 5. Explicitly not doing
 

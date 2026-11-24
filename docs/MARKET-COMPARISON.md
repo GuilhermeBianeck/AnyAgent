@@ -1,6 +1,24 @@
 # AnyAgent — Market Position & Competitive Analysis
 
-**Date:** April 2026
+**Date:** April 2026 · **Updated:** November 2026 (see the next section; the rest of the document is the April analysis)
+
+---
+
+## November 2026 Update
+
+What changed, and what it means. Sources and the requirement each trend produced are in [`REQUIREMENTS-2026-11.md`](REQUIREMENTS-2026-11.md).
+
+| Change since April | Effect on AnyAgent's position | Response (shipped Nov 2026) |
+|---|---|---|
+| **Anthropic closed the Claude-only multi-machine gap**: Claude Code Remote Control (Feb), then self-hosted environments and cross-session messaging (Aug, Team/Enterprise; secondary source). | "Single-machine users (use Claude Code Remote)" no longer bounds the market. For Claude-only users, Anthropic now covers multi-machine. The defensible ground is everything else: **model-agnostic** (Codex, Gemini CLI, Ollama, aider, scripts on one fleet), **free**, **self-hosted**, **personal**. | Unchanged core; positioning below updated. |
+| **MCP 2026-07-28** went stateless (no `initialize`, no session id, `server/discover`); the Tasks extension standardised long-running calls. | Staying on the 1.x SDK would have pinned AnyAgent to the previous protocol. | Hub serves 2026-07-28 natively and older clients via fallback. Task handles use the Tasks vocabulary, with cancel and progress. |
+| **Tool poisoning** became the headline MCP risk (OWASP MCP cheat sheet: pin tool definitions by hash). | AnyAgent forwards worker-declared descriptions to every MCP client, an exposed position for a multi-machine bridge. | Metadata sanitisation, plus hash-pinned agent definitions quarantined on change until reviewed. |
+| **Gateways now compete on governance** (audit, scoped credentials). | "Enterprise teams needing governance (use AgentGateway)" still holds for RBAC/policy engines, but personal users now expect basic controls too. | Audit log of every MCP/A2A call; scoped tokens (per-agent/per-machine allowlists, read-only). |
+| **A2A v1.0** (May) joined MCP under the Agentic AI Foundation; 150+ organisations. | A fleet of agents is exactly what A2A orchestrators delegate to. | Opt-in A2A Agent Card + JSON-RPC (`SendMessage`/`GetTask`/`CancelTask`), tested with the official SDK. |
+
+**Updated one-liner:** AnyAgent is the simplest self-hosted way to make *any* agent on *any* of your machines (not just Claude) callable as an MCP tool or A2A skill, with the safety controls (pinning, scoped tokens, audit) that a bridge between machines needs.
+
+**Updated "not for":** Claude-only users who already have Team/Enterprise self-hosted environments (use Claude Code's). Enterprises needing policy engines and SSO (use a governance gateway). Everything else in the April list still applies.
 
 ---
 
@@ -163,7 +181,7 @@ The MCP ecosystem has been hit hard by security issues:
 - 43% of tested servers had command injection vulnerabilities
 - Trojanized MCP servers distributed malware
 
-AnyAgent's security posture (Ed25519 auth, binary allowlist, env sanitization, timing-safe tokens, .env 0600 permissions) is above-average for the MCP ecosystem.
+AnyAgent's security posture (Ed25519 auth, binary allowlist, env sanitization, timing-safe tokens, .env 0600 permissions) is above-average for the MCP ecosystem. *(Nov 2026: plus metadata sanitisation, hash-pinned agent definitions, scoped tokens and an MCP audit log; see the update above.)*
 
 ---
 
