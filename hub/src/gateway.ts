@@ -191,8 +191,56 @@ export function onTtyOutput(callback: TtyCallback): void {
   ttyOutputCallbacks.push(callback);
 }
 
-export function onStructuredOutput(callback: StructuredOutputCallback): void {
+/** Subscribe to structured worker output. Returns an unsubscribe function. */
+export function onStructuredOutput(callback: StructuredOutputCallback): () => void {
   structuredOutputCallbacks.push(callback);
+  return () => {
+    const i = structuredOutputCallbacks.indexOf(callback);
+    if (i >= 0) structuredOutputCallbacks.splice(i, 1);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Cancelling a running task (AR-6)
+//
+// The worker answers `kill` by killing the process, whose exit then arrives as
+// an `exit` RPC. That exit belongs to the cancelled task, so it must not be
+// applied to whatever task runs next on the node. We remember the pending
+// kill and consume it when the exit arrives. If no exit arrives (process
+// already gone, unresponsive worker) a fallback ends the session so the queue
+// does not stall.
+// ---------------------------------------------------------------------------
+
+const pendingKills = new Map<string, ReturnType<typeof setTimeout>>();
+const KILL_EXIT_GRACE_MS = 30_000;
+
+/** End a node's active session and let listeners advance its queue. */
+function endActiveSession(nodeId: string, exitCode: number): void {
+  clearActiveSession(nodeId);
+  for (const cb of sessionEndCallbacks) {
+    try { cb(nodeId, exitCode); } catch { /* isolate */ }
+  }
+}
+
+/**
+ * Ask a node to kill its running process because its task was cancelled.
+ * Returns false if the node is not connected.
+ */
+export function killForCancel(nodeId: string): boolean {
+  const wsId = nodeMap.get(nodeId);
+  const session = wsId ? sessions.get(wsId) : undefined;
+  if (!session?.authenticated) return false;
+  sendJson(session.ws, makeRpc('kill', {}));
+  const prev = pendingKills.get(nodeId);
+  if (prev) clearTimeout(prev);
+  const fallback = setTimeout(() => {
+    if (!pendingKills.delete(nodeId)) return;
+    console.warn(`[gateway] No exit from ${nodeId} ${KILL_EXIT_GRACE_MS / 1000}s after kill — ending session`);
+    endActiveSession(nodeId, 137);
+  }, KILL_EXIT_GRACE_MS);
+  fallback.unref();
+  pendingKills.set(nodeId, fallback);
+  return true;
 }
 
 export function onSessionEnd(callback: SessionEndCallback): void {
@@ -511,6 +559,15 @@ async function handleMessage(
       const params = req.params as ExitParams;
       console.log(`[gateway] exit from node ${session.nodeId}: code=${params.code}`);
       if (session.nodeId) {
+        // Exit of a process we killed because its task was cancelled: the task
+        // is already 'cancelled'; just end the session so the queue advances.
+        const killTimer = pendingKills.get(session.nodeId);
+        if (killTimer) {
+          clearTimeout(killTimer);
+          pendingKills.delete(session.nodeId);
+          endActiveSession(session.nodeId, params.code);
+          break;
+        }
         const active = getActiveSession(session.nodeId);
         if (active) {
           const label = active.agentName ? `Agent <code>${escapeHtml(active.agentName)}</code>` : 'Session';
@@ -547,6 +604,9 @@ async function handleMessage(
         console.warn(`[gateway] Node ${session.nodeId} sent output for task owned by ${taskForOutput.node_id}, ignoring`);
         break;
       }
+      // A cancelled task may still emit output before its kill lands; it must
+      // not flip back to complete/failed or end the next task's session.
+      if (taskForOutput?.status === 'cancelled') break;
       // Update task status based on output type
       if (params.type === 'result') {
         const payload = params.payload as { text?: string };

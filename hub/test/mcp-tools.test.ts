@@ -70,7 +70,10 @@ test('task_status returns structured task with node alias', async () => {
   const res = await client.callTool({ name: 'anyagent_task_status', arguments: { task_id: 'task_s1' } });
   assert.deepEqual(
     { ...(res.structuredContent as object), createdAt: undefined, updatedAt: undefined },
-    { taskId: 'task_s1', status: 'complete', agent: 'claude', node: 'gpu', intent: 'run tests', result: 'ok', createdAt: undefined, updatedAt: undefined },
+    {
+      taskId: 'task_s1', status: 'complete', taskStatus: 'completed', ttlMs: 30 * 24 * 60 * 60 * 1000,
+      agent: 'claude', node: 'gpu', intent: 'run tests', result: 'ok', createdAt: undefined, updatedAt: undefined,
+    },
   );
 });
 

@@ -13,6 +13,7 @@ import {
   setDefaultAgent, getDefaultAgent, clearDefaultAgent,
   getApprovalMode, setApprovalMode, purgeTasksByChatId,
   listPendingReviews, approvePendingAgent, reviewMode, type PendingReview,
+  cancelTask,
 } from './manager.js';
 import { getAgentByName, getAgentByNameAndAlias, insertTask, updateTaskStatus } from './db.js';
 import { getContext, setContext, appendContext, clearContext } from './context.js';
@@ -51,6 +52,7 @@ function taskIcon(status: TaskStatus): string {
     case 'queued': return `${YELLOW}…${RESET}`;
     case 'pending_approval': return `${YELLOW}?${RESET}`;
     case 'timeout': return `${DIM}⏰${RESET}`;
+    case 'cancelled': return `${DIM}⊘${RESET}`;
     default: return ' ';
   }
 }
@@ -187,7 +189,7 @@ ${BOLD}Usage${RESET}
   tasks               Show recent task history
   history [task_id]   Full history (detail with ID)
   retry <task_id>     Retry a failed task
-  cancel <task_id>    Cancel a queued task
+  cancel <task_id>    Cancel a task (stops it if running)
   y / yes             Approve pending task
   n / no              Deny pending task
   trust               Trust agent + approve
@@ -659,10 +661,9 @@ ${BOLD}Config${RESET}
 
       case 'cancel': {
         if (!argStr) { console.log('Usage: cancel <task_id>'); break; }
-        const cancelTask = getTask(argStr);
-        if (!cancelTask || cancelTask.status !== 'queued') { console.log(`${RED}Task not found or not queued.${RESET}`); break; }
-        updateTaskStatus(argStr, 'failed', { error: 'Cancelled by user' });
-        console.log(`${GREEN}✓${RESET} Task cancelled.`);
+        const cancelled = cancelTask(argStr, 'operator');
+        if (!cancelled.ok) { console.log(`${RED}Cannot cancel: ${cancelled.reason}.${RESET}`); break; }
+        console.log(`${GREEN}✓${RESET} Task cancelled${cancelled.killed ? ' — its process was stopped' : ''}.`);
         break;
       }
 

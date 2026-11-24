@@ -27,7 +27,9 @@ import {
   setDefaultAgent,
   getDefaultAgent,
   clearDefaultAgent,
+  killForCancel,
 } from './gateway.js';
+import { isTerminalStatus } from './types.js';
 import { buildSpawnContext } from './context.js';
 import type { AgentRow, RoutingMethod, TaskRow } from './types.js';
 
@@ -255,6 +257,37 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
     updateTaskStatus(next.task_id, 'running');
     return { outcome: 'started', taskId: next.task_id, agentName: agent.name, chatId: next.chat_id ?? undefined };
   }
+}
+
+// --- Cancellation (AR-6) ---
+
+export interface CancelResult {
+  ok: boolean;
+  task?: TaskRow;
+  reason?: string;
+  /** True if a running process was asked to stop. */
+  killed?: boolean;
+}
+
+/**
+ * Cancel any non-terminal task. Queued / pending-approval / routed tasks are
+ * simply marked cancelled; a running task's process is killed on its worker
+ * (gateway.killForCancel handles the exit that follows).
+ */
+export function cancelTask(taskId: string, by: string = 'user'): CancelResult {
+  const task = getTask(taskId);
+  if (!task) return { ok: false, reason: 'not found' };
+  if (isTerminalStatus(task.status)) return { ok: false, task, reason: `already ${task.status}` };
+
+  const wasRunning = task.status === 'running';
+  updateTaskStatus(taskId, 'cancelled', { error: `Cancelled by ${by}` });
+  let killed = false;
+  if (wasRunning && task.node_id) {
+    killed = killForCancel(task.node_id);
+    // Worker offline: nothing to kill. Free the node; its queue resumes on reconnect.
+    if (!killed) clearActiveSession(task.node_id);
+  }
+  return { ok: true, task: getTask(taskId), killed };
 }
 
 // --- Approval ---
