@@ -25,6 +25,8 @@ export type EventType =
   | 'worker.flapping'
   | 'worker.metadata_sanitized'
   | 'worker.agent_rejected'
+  | 'agent.quarantined'
+  | 'agent.approved'
   | 'task.submitted'
   | 'task.complete'
   | 'task.failed'

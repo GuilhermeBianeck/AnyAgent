@@ -12,6 +12,7 @@ import {
   getActiveSessionByChatId, clearActiveSession, sendTtyInput,
   setDefaultAgent, getDefaultAgent, clearDefaultAgent,
   getApprovalMode, setApprovalMode, purgeTasksByChatId,
+  listPendingReviews, approvePendingAgent, reviewMode, type PendingReview,
 } from './manager.js';
 import { getAgentByName, getAgentByNameAndAlias, insertTask, updateTaskStatus } from './db.js';
 import { getContext, setContext, appendContext, clearContext } from './context.js';
@@ -132,6 +133,23 @@ export function startCli(): void {
     });
   });
 
+  // A worker changed an agent's definition → it is hidden until reviewed (AR-3).
+  onEvent((evt) => {
+    if (evt.type !== 'agent.quarantined') return;
+    console.log(`\n${YELLOW}${BOLD}Agent quarantined:${RESET} ${evt.name} on ${evt.node_id} (${evt.detail ?? 'changed'}). It is hidden until you run ${BOLD}review${RESET}.`);
+    rl.prompt(true);
+  });
+
+  function printReview(r: PendingReview, index: number): void {
+    const what = r.before ? `changed: ${r.changed.join(', ')}` : 'new agent';
+    console.log(`  ${BOLD}#${index}${RESET} ${r.name}@${r.nodeAlias} ${DIM}(${what})${RESET}`);
+    for (const field of r.changed) {
+      const show = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+      if (r.before) console.log(`      ${RED}- ${field}: ${show(r.before[field])}${RESET}`);
+      console.log(`      ${GREEN}+ ${field}: ${show(r.after[field])}${RESET}`);
+    }
+  }
+
   // --- Command handling ---
 
   function handleCommand(line: string): void {
@@ -150,6 +168,8 @@ ${BOLD}Setup${RESET}
   pair                Generate a pairing code
   workers             List registered workers
   revoke <node_id>    Revoke a worker
+  review              Agents quarantined after their definition changed
+  review approve <#|name@alias>  Approve a quarantined agent
 
 ${BOLD}Usage${RESET}
   agents              List agents with capabilities
@@ -484,6 +504,29 @@ ${BOLD}Config${RESET}
         break;
       }
 
+      case 'review': {
+        const pending = listPendingReviews();
+        const [sub, target] = args;
+        if (!sub) {
+          if (pending.length === 0) {
+            console.log(`No agents awaiting review. ${DIM}(AGENT_REVIEW=${reviewMode()})${RESET}`);
+            break;
+          }
+          console.log(`${BOLD}Agents awaiting review${RESET} — hidden from MCP and routing until approved:`);
+          pending.forEach((r, i) => printReview(r, i + 1));
+          console.log(`\n${DIM}Approve: review approve <#|name@alias>. If a change looks malicious, revoke the worker instead.${RESET}`);
+          break;
+        }
+        if (sub !== 'approve' || !target) { console.log('Usage: review | review approve <#|name@alias>'); break; }
+        const byIndex = /^#?\d+$/.test(target) ? pending[parseInt(target.replace('#', ''), 10) - 1] : undefined;
+        const picked = byIndex ?? pending.find(r => `${r.name}@${r.nodeAlias}` === target);
+        if (!picked) { console.log(`${RED}No pending agent "${target}". Run "review" to list.${RESET}`); break; }
+        const approved = approvePendingAgent(picked.id);
+        if (approved) console.log(`${GREEN}✓${RESET} Approved ${approved.name}@${approved.nodeAlias}. It is visible to MCP and routing again.`);
+        else console.log(`${RED}Could not approve — it may have been approved or changed again.${RESET}`);
+        break;
+      }
+
       case 'revoke': {
         if (!argStr) { console.log('Usage: revoke <node_id>'); break; }
         const ok = revokeWorker(argStr);
@@ -555,11 +598,14 @@ ${BOLD}Config${RESET}
         const pending = tasks.find(t => t.status === 'pending_approval');
         if (!pending) { console.log('No pending approvals.'); break; }
         const decision = handleApprovalDecision(pending.task_id, 'approve');
-        if (decision.ok && decision.task && decision.agentName) {
-          const agent = getAgentByName(decision.agentName);
-          if (agent) {
-            const r = startAgentForTask(agent, pending.task_id, decision.task.intent, CLI_CHAT_ID, 'explicit');
+        if (decision.ok && decision.task) {
+          // decision.agent is bound to the approved machine (not re-resolved by name)
+          if (decision.agent) {
+            const r = startAgentForTask(decision.agent, pending.task_id, decision.task.intent, CLI_CHAT_ID, 'explicit');
             renderStartResult(r);
+          } else {
+            updateTaskStatus(pending.task_id, 'failed', { error: 'Agent no longer exists' });
+            console.log(`${RED}✗${RESET} Agent no longer available.`);
           }
         }
         break;
@@ -582,10 +628,12 @@ ${BOLD}Config${RESET}
         const decision3 = handleApprovalDecision(pending3.task_id, 'trust');
         if (decision3.ok && decision3.task && decision3.agentName) {
           console.log(`${GREEN}✓${RESET} Agent ${decision3.agentName} trusted.`);
-          const agent3 = getAgentByName(decision3.agentName);
-          if (agent3) {
-            const r3 = startAgentForTask(agent3, pending3.task_id, decision3.task.intent, CLI_CHAT_ID, 'explicit');
+          if (decision3.agent) {
+            const r3 = startAgentForTask(decision3.agent, pending3.task_id, decision3.task.intent, CLI_CHAT_ID, 'explicit');
             renderStartResult(r3);
+          } else {
+            updateTaskStatus(pending3.task_id, 'failed', { error: 'Agent no longer exists' });
+            console.log(`${RED}✗${RESET} Agent no longer available.`);
           }
         }
         break;
