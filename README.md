@@ -229,6 +229,7 @@ anyagent> route fix the authentication bug
 | `purge` | Clear task history |
 | `events [watch]` | Recent worker/task events, or tail live |
 | `net` | Recent outbound connections (requires `AUDIT_NETWORK=1`) |
+| `audit [n]` | Recent MCP tool calls: token, tool, `agent@node`, outcome (full log in `hub/logs/audit.log`) |
 | `status` | Current status |
 
 Any unrecognized text is forwarded as input to the active agent session.

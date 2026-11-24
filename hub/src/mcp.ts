@@ -14,6 +14,7 @@ import type { TaskRow } from './types.js';
 import { insertTask } from './db.js';
 import { getBuildInfo, uptimeSeconds } from './build-info.js';
 import { metricsEnabled, renderMetrics, setWorkersOnline } from './metrics.js';
+import { recordMcpCall } from './audit.js';
 
 // ---------------------------------------------------------------------------
 // Tool metadata (AR-1). Annotations let MCP clients tell a read-only status
@@ -203,15 +204,27 @@ export function explicitToolName(agentName: string, nodeAlias: string): string {
   return `anyagent_${mcpSafe(agentName)}_${mcpSafe(nodeAlias)}`;
 }
 
+/** Who is calling, resolved from the bearer token for this HTTP request. */
+export interface McpRequestContext {
+  /** Token label for the audit trail; "admin" is MCP_TOKEN. */
+  token: string;
+}
+
+const ADMIN_CONTEXT: McpRequestContext = { token: 'admin' };
+
 /**
- * Registers tools while refusing duplicates. Two different agents can map to
- * the same MCP name (agent `claude` on node `spot` and an agent literally
- * called `claude_spot`), and the SDK throws on a duplicate — which would fail
- * every MCP request, not just the clashing tool. First registration wins.
+ * Registers tools while refusing duplicates, and wraps every handler with
+ * the audit trail (AR-4).
+ *
+ * Duplicates: two different agents can map to the same MCP name (agent
+ * `claude` on node `spot` and an agent literally called `claude_spot`), and
+ * the SDK throws on a duplicate — which would fail every MCP request, not
+ * just the clashing tool. First registration wins.
  */
 class ToolRegistry {
   private readonly names = new Set<string>();
-  constructor(readonly server: McpServer) {}
+  constructor(readonly server: McpServer, readonly ctx: McpRequestContext) {}
+
   claim(name: string): boolean {
     if (this.names.has(name)) {
       console.warn(`[mcp] Tool name "${name}" is already registered — skipping duplicate`);
@@ -219,6 +232,20 @@ class ToolRegistry {
     }
     this.names.add(name);
     return true;
+  }
+
+  /** Wrap a tool handler so every call is timed and recorded. */
+  handler<A>(tool: string, fn: (args: A) => Promise<ToolResult>): (args: A) => Promise<ToolResult> {
+    return async (args: A) => {
+      const started = Date.now();
+      let result: ToolResult | undefined;
+      try {
+        result = await fn(args);
+        return result;
+      } finally {
+        recordMcpCall({ tool, token: this.ctx.token, args, result, threw: result === undefined, durationMs: Date.now() - started });
+      }
+    };
   }
 }
 
@@ -244,7 +271,7 @@ function registerStaticTools(reg: ToolRegistry): void {
         })),
       },
     },
-    async () => {
+    reg.handler('anyagent_list_agents', async () => {
       const agents = getAgentList();
       const structured = {
         agents: agents.map(a => ({
@@ -293,7 +320,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       lines.push('Call short form (hub picks the node):  anyagent_<name>');
       lines.push('Call a specific machine:               anyagent_<name>_<alias>');
       return textResult(lines.join('\n'), structured);
-    }
+    })
   );
 
   reg.claim('anyagent_route');
@@ -309,7 +336,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       },
       outputSchema: taskOutputShape,
     },
-    async ({ intent, timeout_ms }) => {
+    reg.handler('anyagent_route', async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
       const routing = findAgentByCapability(intent);
       if (routing.type === 'none') {
         return textResult('No online agents available.', undefined, true);
@@ -320,7 +347,7 @@ function registerStaticTools(reg: ToolRegistry): void {
         return textResult('No matching agent found.', undefined, true);
       }
       return handleToolCall(agent.name, intent, timeout_ms, 'matched');
-    }
+    })
   );
 
   reg.claim('anyagent_task_status');
@@ -333,7 +360,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       inputSchema: { task_id: z.string().describe('The task ID returned by anyagent_route or anyagent_<agent>') },
       outputSchema: taskOutputShape,
     },
-    async ({ task_id }) => {
+    reg.handler('anyagent_task_status', async ({ task_id }: { task_id: string }) => {
       const task = getTask(task_id);
       if (!task) {
         return textResult(`Task ${task_id} not found.`, undefined, true);
@@ -346,7 +373,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       if (task.result_summary) text += `\nResult: ${task.result_summary}`;
       if (task.error) text += `\nError: ${task.error}`;
       return textResult(text, out);
-    }
+    })
   );
 
   reg.claim('anyagent_context');
@@ -358,10 +385,10 @@ function registerStaticTools(reg: ToolRegistry): void {
       annotations: READ_ONLY,
       outputSchema: { context: z.string() },
     },
-    async () => {
+    reg.handler('anyagent_context', async () => {
       const ctx = getContext();
       return textResult(ctx || 'No operator context set.', { context: ctx ?? '' });
-    }
+    })
   );
 }
 
@@ -400,9 +427,9 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         },
         outputSchema: taskOutputShape,
       },
-      async ({ intent, timeout_ms }) => {
+      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
         return handleToolCall(name, intent, timeout_ms, 'explicit');
-      }
+      })
     );
   }
 
@@ -428,20 +455,20 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         },
         outputSchema: taskOutputShape,
       },
-      async ({ intent, timeout_ms }) => {
+      reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
         return handleToolCall(a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
-      }
+      })
     );
   }
 }
 
 /** Build a fully-registered MCP server instance (one per HTTP request). */
-export function buildMcpServer(): McpServer {
+export function buildMcpServer(ctx: McpRequestContext = ADMIN_CONTEXT): McpServer {
   const server = new McpServer(
     { name: 'anyagent-hub', title: 'AnyAgent', version: getBuildInfo().version },
     { capabilities: { tools: {} } }
   );
-  const reg = new ToolRegistry(server);
+  const reg = new ToolRegistry(server, ctx);
   registerStaticTools(reg);
   registerDynamicAgentTools(reg);
   return server;

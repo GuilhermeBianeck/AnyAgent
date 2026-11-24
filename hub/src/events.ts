@@ -7,15 +7,12 @@
  * threshold in a window, we emit `worker.flapping` and notify listeners.
  */
 
-import { mkdirSync, appendFileSync, statSync, renameSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { logsDir } from './paths.js';
+import { createJsonlWriter } from './jsonl.js';
 
-const LOGS_DIR = logsDir();
-const EVENTS_PATH = join(LOGS_DIR, 'events.log');
-
-const MAX_EVENTS_BYTES = 5 * 1024 * 1024; // 5MB
-const MAX_EVENTS_FILES = 3;
+const EVENTS_PATH = join(logsDir(), 'events.log');
+const writer = createJsonlWriter(EVENTS_PATH, 5 * 1024 * 1024 /* 5MB */, 3);
 
 export type EventType =
   | 'worker.online'
@@ -78,35 +75,13 @@ function checkFlap(nodeId: string): boolean {
   return false;
 }
 
-function rotateIfNeeded(): void {
-  try {
-    if (!existsSync(EVENTS_PATH)) return;
-    if (statSync(EVENTS_PATH).size < MAX_EVENTS_BYTES) return;
-    const oldest = `${EVENTS_PATH}.${MAX_EVENTS_FILES}`;
-    if (existsSync(oldest)) unlinkSync(oldest);
-    for (let i = MAX_EVENTS_FILES - 1; i >= 1; i--) {
-      const from = `${EVENTS_PATH}.${i}`;
-      if (existsSync(from)) renameSync(from, `${EVENTS_PATH}.${i + 1}`);
-    }
-    renameSync(EVENTS_PATH, `${EVENTS_PATH}.1`);
-  } catch {
-    // ignore
-  }
-}
-
 export function emit(type: EventType, extra: Partial<HubEvent> = {}): void {
-  try { mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 }); } catch { /* best effort */ }
   const evt: HubEvent = {
     t: new Date().toISOString(),
     type,
     ...extra,
   };
-  try {
-    rotateIfNeeded();
-    appendFileSync(EVENTS_PATH, JSON.stringify(evt) + '\n');
-  } catch {
-    // best effort
-  }
+  writer.append(evt);
   recentEvents.push(evt);
   if (recentEvents.length > MAX_RECENT) recentEvents.shift();
   for (const l of listeners) {
