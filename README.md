@@ -177,6 +177,8 @@ Full operations guide: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## MCP Tools
 
+The hub speaks **MCP 2026-07-28** (the stateless revision: no `initialize` handshake or session id, `server/discover`) and keeps serving clients on **2025-11-25 and earlier** through a stateless fallback. No configuration needed; each client gets the newest protocol it supports.
+
 Every registered agent becomes an MCP tool. Plus these built-in tools:
 
 | Tool | Input | Description |
