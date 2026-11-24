@@ -23,6 +23,8 @@ export type EventType =
   | 'worker.auth_fail'
   | 'worker.heartbeat_miss'
   | 'worker.flapping'
+  | 'worker.metadata_sanitized'
+  | 'worker.agent_rejected'
   | 'task.submitted'
   | 'task.complete'
   | 'task.failed'
