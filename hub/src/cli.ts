@@ -21,6 +21,7 @@ import { stripAnsi } from './output.js';
 import type { OutputParams, TaskStatus } from './types.js';
 import { getBuildInfo, formatUptime, uptimeSeconds } from './build-info.js';
 import { recentEventsList, onEvent, eventsLogPath } from './events.js';
+import { recentAudit, auditLogPath } from './audit.js';
 import { metricsEnabled } from './metrics.js';
 import { recentConnections, auditEnabled, airgapEnabled } from './netlog.js';
 import { logPath } from './logger.js';
@@ -193,6 +194,7 @@ ${BOLD}Config${RESET}
 
   status              Show version, uptime, workers, approval mode
   events [watch]      Recent worker state transitions (watch tails live)
+  audit [n]           Recent MCP tool calls (who, what, outcome)
   net                 Recent outbound connections (AUDIT_NETWORK=1)
   help                Show this help
   quit                Exit
@@ -500,6 +502,23 @@ ${BOLD}Config${RESET}
           console.log(`${GREEN}✓${RESET} Context cleared.`);
         } else {
           console.log('Usage: context [set <text> | add <line> | clear]');
+        }
+        break;
+      }
+
+      case 'audit': {
+        const n = Math.min(Math.max(parseInt(argStr || '20', 10) || 20, 1), 200);
+        const rows = recentAudit(n);
+        if (rows.length === 0) {
+          console.log(`No MCP calls since the hub started. ${DIM}Full log: ${auditLogPath()}${RESET}`);
+          break;
+        }
+        console.log(`${BOLD}MCP calls${RESET} ${DIM}(last ${rows.length}; full log: ${auditLogPath()})${RESET}`);
+        for (const r of rows) {
+          const color = r.outcome === 'ok' ? GREEN : r.outcome === 'error' ? YELLOW : RED;
+          const target = r.agent ? ` → ${r.agent}${r.node ? '@' + r.node : ''}` : '';
+          const task = r.task_id ? ` ${DIM}${r.task_id}${r.status ? ' ' + r.status : ''}${RESET}` : '';
+          console.log(`  ${DIM}${r.t.slice(11, 19)}${RESET} ${color}${r.outcome.padEnd(9)}${RESET} ${r.token.padEnd(10)} ${r.tool}${target}${task} ${DIM}${r.duration_ms}ms${RESET}`);
         }
         break;
       }

@@ -102,7 +102,13 @@ readinessProbe:
   Mirrors everything sent to `console.log` / `console.warn` / `console.error`.
 - **Event log:** `hub/logs/events.log` — JSON lines, worker state transitions
   (`worker.online`, `worker.offline`, `worker.heartbeat_miss`, `worker.flapping`,
-  `task.complete`, `task.failed`, `hub.started`). Rotated at 5MB × 3 files.
+  `task.complete`, `task.failed`, `hub.started`), plus agent security events
+  (`worker.agent_rejected`, `worker.metadata_sanitized`, `agent.quarantined`,
+  `agent.approved`). Rotated at 5MB × 3 files.
+- **MCP audit log:** `hub/logs/audit.log` — one JSON line per MCP tool call:
+  tool, token label, resolved `agent@node`, task id, outcome, duration. The
+  intent is stored only as a SHA-256 prefix unless `AUDIT_LOG_INTENT=1`.
+  Rotated at 10MB × 5 files. `audit [n]` in the CLI shows recent calls.
 - **Network audit:** `hub/logs/network.log` — outbound connections when
   `AUDIT_NETWORK=1`. Use this if you need proof that the hub talks only to
   Telegram (or nothing at all with `AIRGAP=1`).
@@ -124,6 +130,7 @@ anyagent> events watch
 | `ENABLE_METRICS` | unset | Set `=1` to expose `/metrics`. |
 | `READY_ALLOW_EMPTY` | unset | Set `=1` so `/ready` returns 200 with no workers (bootstrap). |
 | `AUDIT_NETWORK` | unset | Log every outbound connection to `network.log`. |
+| `AUDIT_LOG_INTENT` | unset | Set `=1` to store MCP intent text in `audit.log` (default: SHA-256 prefix only). |
 | `AIRGAP` | unset | Refuse non-loopback outbound connections. Fails fast if `BOT_TOKEN` is set. |
 | `AGENT_REVIEW` | `changes` | Quarantine agents whose definition changed until approved with `review`. `all` also quarantines new agents; `off` disables pinning. |
 | `LOG_MAX_BYTES` | `10485760` | Rotation threshold for `hub.log`. |

@@ -5,6 +5,7 @@
  *
  * Emits:
  *   anyagent_tasks_total{status,source}    counter
+ *   anyagent_mcp_calls_total{tool,outcome} counter
  *   anyagent_workers_online                gauge
  *   anyagent_worker_reconnects_total       counter
  *   anyagent_auth_failures_total           counter
@@ -19,6 +20,7 @@ const ENABLED = process.env.ENABLE_METRICS === '1';
 
 // counters (monotonic)
 const taskCounters = new Map<string, number>(); // key: `${status}|${source}`
+const mcpCallCounters = new Map<string, number>(); // key: `${tool}|${outcome}`
 let reconnects = 0;
 let authFailures = 0;
 
@@ -33,6 +35,12 @@ export function incTask(status: string, source: string): void {
   if (!ENABLED) return;
   const key = `${status}|${source}`;
   taskCounters.set(key, (taskCounters.get(key) ?? 0) + 1);
+}
+
+export function incMcpCall(tool: string, outcome: string): void {
+  if (!ENABLED) return;
+  const key = `${tool}|${outcome}`;
+  mcpCallCounters.set(key, (mcpCallCounters.get(key) ?? 0) + 1);
 }
 
 export function incReconnect(): void {
@@ -79,6 +87,13 @@ export function renderMetrics(): string {
   for (const [key, count] of taskCounters.entries()) {
     const [status, source] = key.split('|');
     lines.push(`anyagent_tasks_total{status="${status}",source="${source}"} ${count}`);
+  }
+
+  lines.push('# HELP anyagent_mcp_calls_total MCP tool calls by tool and outcome');
+  lines.push('# TYPE anyagent_mcp_calls_total counter');
+  for (const [key, count] of mcpCallCounters.entries()) {
+    const [tool, outcome] = key.split('|');
+    lines.push(`anyagent_mcp_calls_total{tool="${tool}",outcome="${outcome}"} ${count}`);
   }
 
   return lines.join('\n') + '\n';
