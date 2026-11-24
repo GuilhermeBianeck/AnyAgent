@@ -175,6 +175,55 @@ db.exec(`
 // `tasks` migrations — must run after the CREATE TABLE above.
 try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 
+// Scoped MCP tokens (AR-5). Only the SHA-256 of a token is stored.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT UNIQUE NOT NULL,
+    token_sha256 TEXT UNIQUE NOT NULL,
+    agents TEXT NOT NULL DEFAULT '*',
+    readonly INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used_at TEXT
+  );
+`);
+
+export interface McpTokenRow {
+  id: number;
+  label: string;
+  token_sha256: string;
+  /** '*' or a JSON array of allowlist entries ("name" or "name@alias"). */
+  agents: string;
+  readonly: number;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export function insertMcpToken(label: string, tokenSha256: string, agents: string, readonly: boolean): void {
+  db.prepare(`INSERT INTO mcp_tokens (label, token_sha256, agents, readonly) VALUES (?, ?, ?, ?)`)
+    .run(label, tokenSha256, agents, readonly ? 1 : 0);
+}
+
+export function getMcpTokenByHash(tokenSha256: string): McpTokenRow | undefined {
+  return db.prepare(`SELECT * FROM mcp_tokens WHERE token_sha256 = ?`).get(tokenSha256) as McpTokenRow | undefined;
+}
+
+export function getMcpTokenByLabel(label: string): McpTokenRow | undefined {
+  return db.prepare(`SELECT * FROM mcp_tokens WHERE label = ?`).get(label) as McpTokenRow | undefined;
+}
+
+export function listMcpTokens(): McpTokenRow[] {
+  return db.prepare(`SELECT * FROM mcp_tokens ORDER BY created_at, id`).all() as McpTokenRow[];
+}
+
+export function deleteMcpToken(label: string): boolean {
+  return db.prepare(`DELETE FROM mcp_tokens WHERE label = ?`).run(label).changes > 0;
+}
+
+export function touchMcpToken(id: number): void {
+  db.prepare(`UPDATE mcp_tokens SET last_used_at = datetime('now') WHERE id = ?`).run(id);
+}
+
 // Pair code operations
 export function insertPairCode(code: string, expiresAt: Date, wsId: string): void {
   db.prepare(

@@ -22,6 +22,8 @@ import type { OutputParams, TaskStatus } from './types.js';
 import { getBuildInfo, formatUptime, uptimeSeconds } from './build-info.js';
 import { recentEventsList, onEvent, eventsLogPath } from './events.js';
 import { recentAudit, auditLogPath } from './audit.js';
+import { createToken, listTokens, revokeToken, TokenError } from './tokens.js';
+import { mcpServerRunning } from './mcp.js';
 import { metricsEnabled } from './metrics.js';
 import { recentConnections, auditEnabled, airgapEnabled } from './netlog.js';
 import { logPath } from './logger.js';
@@ -171,6 +173,10 @@ ${BOLD}Setup${RESET}
   revoke <node_id>    Revoke a worker
   review              Agents quarantined after their definition changed
   review approve <#|name@alias>  Approve a quarantined agent
+  token list          Scoped MCP tokens
+  token create <label> [--agents a,b@alias] [--readonly]
+                      New MCP token limited to some agents / read-only
+  token revoke <label>
 
 ${BOLD}Usage${RESET}
   agents              List agents with capabilities
@@ -503,6 +509,56 @@ ${BOLD}Config${RESET}
         } else {
           console.log('Usage: context [set <text> | add <line> | clear]');
         }
+        break;
+      }
+
+      case 'token':
+      case 'tokens': {
+        const [sub = 'list', label, ...rest] = args;
+        if (sub === 'list') {
+          const tokens = listTokens();
+          if (tokens.length === 0) {
+            console.log(`No scoped tokens. ${DIM}MCP_TOKEN is the admin token; "token create <label>" adds a limited one.${RESET}`);
+            break;
+          }
+          console.log(`${BOLD}MCP tokens${RESET} ${DIM}(plus "admin" = MCP_TOKEN if set)${RESET}`);
+          for (const t of tokens) {
+            const agents = t.agents === '*' ? 'all agents' : t.agents.join(', ');
+            const used = t.lastUsedAt ? `last used ${t.lastUsedAt}` : 'never used';
+            const access = t.readonly ? `${YELLOW}read-only${RESET} (${agents})` : agents;
+            console.log(`  ${BOLD}${t.token}${RESET}  ${access}  ${DIM}${used}${RESET}`);
+          }
+          break;
+        }
+        if (sub === 'create') {
+          if (!label) { console.log('Usage: token create <label> [--agents a,b@alias] [--readonly]'); break; }
+          let agents: string[] | undefined;
+          let readonly = false;
+          for (let i = 0; i < rest.length; i++) {
+            const flag = rest[i];
+            if (flag === '--readonly' || flag === '--read-only') readonly = true;
+            else if (flag === '--agents') agents = (rest[++i] ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            else if (flag.startsWith('--agents=')) agents = flag.slice(9).split(',').map(s => s.trim()).filter(Boolean);
+            else { console.log(`${RED}Unknown option "${flag}".${RESET}`); agents = undefined; readonly = false; break; }
+          }
+          try {
+            const { token, scope } = createToken(label, { agents, readonly });
+            const what = scope.readonly ? 'read-only' : scope.agents === '*' ? 'all agents' : scope.agents.join(', ');
+            console.log(`${GREEN}✓${RESET} Token ${BOLD}${label}${RESET} (${what}). Copy it now — it is not shown again:\n\n  ${BOLD}${token}${RESET}\n`);
+            console.log(`${DIM}Use it as: Authorization: Bearer <token>${RESET}`);
+            if (!mcpServerRunning()) console.log(`${YELLOW}The MCP server is not running. Restart the hub to enable it.${RESET}`);
+          } catch (err) {
+            if (err instanceof TokenError) console.log(`${RED}${err.message}${RESET}`);
+            else throw err;
+          }
+          break;
+        }
+        if (sub === 'revoke') {
+          if (!label) { console.log('Usage: token revoke <label>'); break; }
+          console.log(revokeToken(label) ? `${GREEN}✓${RESET} Token ${label} revoked.` : `${RED}No token "${label}".${RESET}`);
+          break;
+        }
+        console.log('Usage: token [list] | token create <label> [--agents a,b@alias] [--readonly] | token revoke <label>');
         break;
       }
 

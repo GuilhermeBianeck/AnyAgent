@@ -7,6 +7,7 @@ initNetlog();
 import { createBot } from './bot.js';
 import { createGateway, onWorkerOnline } from './gateway.js';
 import { createMcpServer, onMcpTask } from './mcp.js';
+import { hasScopedTokens } from './tokens.js';
 import { startCli } from './cli.js';
 import { failStaleTasks, clearAllSessions, cleanOldTasks } from './db.js';
 import { escapeHtml } from './format.js';
@@ -63,8 +64,8 @@ onWorkerOnline((nodeId) => {
   }
 });
 
-// MCP server (if token set)
-if (MCP_TOKEN) {
+// MCP server — enabled by MCP_TOKEN (admin) and/or scoped tokens from `token create`
+if (MCP_TOKEN || hasScopedTokens()) {
   createMcpServer(MCP_PORT, MCP_TOKEN);
 
   if (bot) {
@@ -77,9 +78,9 @@ if (MCP_TOKEN) {
     });
   }
 
-  console.log(`[hub] MCP server on port ${MCP_PORT}`);
+  console.log(`[hub] MCP server on port ${MCP_PORT}${MCP_TOKEN ? '' : ' (scoped tokens only; MCP_TOKEN unset)'}`);
 } else {
-  console.log('[hub] MCP server disabled (set MCP_TOKEN to enable)');
+  console.log('[hub] MCP server disabled (set MCP_TOKEN, or run "token create <label>" and restart)');
 }
 
 // Telegram bot (optional — only if BOT_TOKEN set)

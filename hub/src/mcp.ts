@@ -3,8 +3,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { timingSafeEqual } from 'crypto';
 import { getTask, getNodeById, nodeDisplayAlias } from './db.js';
+import { ADMIN_SCOPE, resolveBearer, scopeAllows, scopeAllowsAnyNode, type TokenScope } from './tokens.js';
+import type { AgentRow } from './types.js';
 import {
   findAgentByCapability, createTaskId, startAgentForTask,
   getAgentList, getWorkerList, resolveShortFormAgent,
@@ -124,7 +125,21 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
   return null;
 }
 
-async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<ToolResult> {
+// Results refused by token scope. Tracked out-of-band so the audit wrapper can
+// record outcome "denied" without adding fields to what the client receives.
+const deniedResults = new WeakMap<ToolResult, string>();
+
+function deniedResult(text: string, reason: string): ToolResult {
+  const r = textResult(text, undefined, true);
+  deniedResults.set(r, reason);
+  return r;
+}
+
+function aliasOf(agent: AgentRow): string {
+  return nodeAliasFor(agent.node_id) ?? agent.node_id.replace(/^node_/, '').slice(0, 8);
+}
+
+async function handleToolCall(scope: TokenScope, agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<ToolResult> {
   const { getAgentByNameAndAlias } = await import('./db.js');
   // If the caller targeted a specific node via `anyagent_<name>_<alias>`, resolve
   // it that way — never collapse the collision to some other node.
@@ -136,6 +151,11 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
       ? `Agent "${agentName}@${options.explicitAlias}" not found (alias may be stale — try anyagent_list_agents).`
       : `Agent "${agentName}" not found.`;
     return textResult(hint, undefined, true);
+  }
+  // Defence in depth: tools outside the token's scope are not even listed,
+  // but re-check against the machine the call actually resolved to.
+  if (!scopeAllows(scope, agent.name, aliasOf(agent))) {
+    return deniedResult(`Token "${scope.token}" may not call ${agent.name}@${aliasOf(agent)}.`, `out of scope: ${agent.name}@${aliasOf(agent)}`);
   }
 
   const taskId = createTaskId();
@@ -204,14 +224,6 @@ export function explicitToolName(agentName: string, nodeAlias: string): string {
   return `anyagent_${mcpSafe(agentName)}_${mcpSafe(nodeAlias)}`;
 }
 
-/** Who is calling, resolved from the bearer token for this HTTP request. */
-export interface McpRequestContext {
-  /** Token label for the audit trail; "admin" is MCP_TOKEN. */
-  token: string;
-}
-
-const ADMIN_CONTEXT: McpRequestContext = { token: 'admin' };
-
 /**
  * Registers tools while refusing duplicates, and wraps every handler with
  * the audit trail (AR-4).
@@ -223,7 +235,7 @@ const ADMIN_CONTEXT: McpRequestContext = { token: 'admin' };
  */
 class ToolRegistry {
   private readonly names = new Set<string>();
-  constructor(readonly server: McpServer, readonly ctx: McpRequestContext) {}
+  constructor(readonly server: McpServer, readonly ctx: TokenScope) {}
 
   claim(name: string): boolean {
     if (this.names.has(name)) {
@@ -243,7 +255,11 @@ class ToolRegistry {
         result = await fn(args);
         return result;
       } finally {
-        recordMcpCall({ tool, token: this.ctx.token, args, result, threw: result === undefined, durationMs: Date.now() - started });
+        recordMcpCall({
+          tool, token: this.ctx.token, args, result, threw: result === undefined,
+          denied: result ? deniedResults.get(result) : undefined,
+          durationMs: Date.now() - started,
+        });
       }
     };
   }
@@ -251,6 +267,7 @@ class ToolRegistry {
 
 function registerStaticTools(reg: ToolRegistry): void {
   const server = reg.server;
+  const scope = reg.ctx;
   reg.claim('anyagent_list_agents');
   server.registerTool(
     'anyagent_list_agents',
@@ -272,7 +289,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       },
     },
     reg.handler('anyagent_list_agents', async () => {
-      const agents = getAgentList();
+      const agents = getAgentList().filter(a => scopeAllows(scope, a.name, a.nodeAlias));
       const structured = {
         agents: agents.map(a => ({
           name: a.name,
@@ -281,7 +298,8 @@ function registerStaticTools(reg: ToolRegistry): void {
           online: a.online,
           description: a.description,
           capabilities: a.capabilities,
-          tool: shortToolName(a.name),
+          // A token scoped to name@alias has no short-form tool for this agent.
+          tool: scopeAllowsAnyNode(scope, a.name) ? shortToolName(a.name) : explicitToolName(a.name, a.nodeAlias),
           explicitTool: explicitToolName(a.name, a.nodeAlias),
         })),
       };
@@ -323,6 +341,7 @@ function registerStaticTools(reg: ToolRegistry): void {
     })
   );
 
+  if (!scope.readonly) {
   reg.claim('anyagent_route');
   server.registerTool(
     'anyagent_route',
@@ -337,7 +356,8 @@ function registerStaticTools(reg: ToolRegistry): void {
       outputSchema: taskOutputShape,
     },
     reg.handler('anyagent_route', async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
-      const routing = findAgentByCapability(intent);
+      // Only agents this token may call are candidates.
+      const routing = findAgentByCapability(intent, a => scopeAllows(scope, a.name, aliasOf(a)));
       if (routing.type === 'none') {
         return textResult('No online agents available.', undefined, true);
       }
@@ -346,9 +366,12 @@ function registerStaticTools(reg: ToolRegistry): void {
       if (!agent) {
         return textResult('No matching agent found.', undefined, true);
       }
-      return handleToolCall(agent.name, intent, timeout_ms, 'matched');
+      // Pin to the machine routing chose, so short-form resolution cannot
+      // move the task to a same-named agent elsewhere.
+      return handleToolCall(scope, agent.name, intent, timeout_ms, 'matched', { explicitAlias: aliasOf(agent) });
     })
   );
+  }
 
   reg.claim('anyagent_task_status');
   server.registerTool(
@@ -364,6 +387,14 @@ function registerStaticTools(reg: ToolRegistry): void {
       const task = getTask(task_id);
       if (!task) {
         return textResult(`Task ${task_id} not found.`, undefined, true);
+      }
+      // A scoped token must not read results of agents it cannot call. Answer
+      // "not found" rather than confirming the task exists.
+      if (scope.agents !== '*') {
+        const alias = nodeAliasFor(task.node_id) ?? '';
+        if (!task.agent_name || !scopeAllows(scope, task.agent_name, alias)) {
+          return deniedResult(`Task ${task_id} not found.`, `out of scope: ${task.agent_name ?? 'unrouted'}@${alias}`);
+        }
       }
       // Surface WHICH machine the task ran on so the operator knows which
       // worker to look at for logs, CLI state, etc. when they didn't pick.
@@ -394,7 +425,9 @@ function registerStaticTools(reg: ToolRegistry): void {
 
 function registerDynamicAgentTools(reg: ToolRegistry): void {
   const server = reg.server;
-  const agents = getAgentList();
+  const scope = reg.ctx;
+  if (scope.readonly) return; // read-only tokens cannot run agents
+  const agents = getAgentList().filter(a => scopeAllows(scope, a.name, a.nodeAlias));
 
   // ---- Short-form tools (one per distinct agent NAME, regardless of node) ----
   // Register `anyagent_<name>` once per distinct name. The handler uses the
@@ -408,6 +441,9 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
   }
 
   for (const [name, variants] of byName.entries()) {
+    // The short form lets the hub pick the machine, so it needs the bare name
+    // in scope — a token limited to claude@laptop only gets the explicit tool.
+    if (!scopeAllowsAnyNode(scope, name)) continue;
     const toolName = shortToolName(name);
     if (!reg.claim(toolName)) continue;
     const caps = variants[0].capabilities.length > 0 ? ` [${variants[0].capabilities.join(', ')}]` : '';
@@ -428,7 +464,7 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         outputSchema: taskOutputShape,
       },
       reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
-        return handleToolCall(name, intent, timeout_ms, 'explicit');
+        return handleToolCall(scope, name, intent, timeout_ms, 'explicit');
       })
     );
   }
@@ -456,14 +492,14 @@ function registerDynamicAgentTools(reg: ToolRegistry): void {
         outputSchema: taskOutputShape,
       },
       reg.handler(toolName, async ({ intent, timeout_ms }: { intent: string; timeout_ms?: number }) => {
-        return handleToolCall(a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
+        return handleToolCall(scope, a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
       })
     );
   }
 }
 
 /** Build a fully-registered MCP server instance (one per HTTP request). */
-export function buildMcpServer(ctx: McpRequestContext = ADMIN_CONTEXT): McpServer {
+export function buildMcpServer(ctx: TokenScope = ADMIN_SCOPE): McpServer {
   const server = new McpServer(
     { name: 'anyagent-hub', title: 'AnyAgent', version: getBuildInfo().version },
     { capabilities: { tools: {} } }
@@ -476,9 +512,21 @@ export function buildMcpServer(ctx: McpRequestContext = ADMIN_CONTEXT): McpServe
 
 // --- HTTP Server ---
 
-export function createMcpServer(mcpPort: number, mcpToken: string): Server {
+let running = false;
+
+/** Whether the MCP HTTP server was started in this process. */
+export function mcpServerRunning(): boolean {
+  return running;
+}
+
+/**
+ * Start the MCP HTTP server. `adminToken` (MCP_TOKEN) grants full access;
+ * scoped tokens from the `token` CLI command are also accepted. With no admin
+ * token, only scoped tokens can authenticate.
+ */
+export function createMcpServer(mcpPort: number, adminToken?: string): Server {
   const MAX_BODY_SIZE = 1_048_576;
-  const expectedToken = Buffer.from(`Bearer ${mcpToken}`);
+  running = true;
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     // ---- Unauthenticated liveness / readiness / metrics endpoints ----
@@ -528,11 +576,9 @@ export function createMcpServer(mcpPort: number, mcpToken: string): Server {
       return;
     }
 
-    // ---- MCP JSON-RPC endpoint — Bearer required ----
-    const authHeader = req.headers.authorization ?? '';
-    const authBuf = Buffer.from(authHeader);
-    const valid = authBuf.length === expectedToken.length && timingSafeEqual(authBuf, expectedToken);
-    if (!valid) {
+    // ---- MCP JSON-RPC endpoint — Bearer required (admin or scoped token) ----
+    const scope = resolveBearer(req.headers.authorization, adminToken);
+    if (!scope) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -567,7 +613,7 @@ export function createMcpServer(mcpPort: number, mcpToken: string): Server {
       }
     }
 
-    const server = buildMcpServer();
+    const server = buildMcpServer(scope);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
     await transport.handleRequest(req, res, parsed);
