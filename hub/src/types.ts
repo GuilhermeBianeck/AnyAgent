@@ -121,7 +121,7 @@ export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['complete', 'faile
 export function isTerminalStatus(status: string): boolean {
   return (TERMINAL_TASK_STATUSES as readonly string[]).includes(status);
 }
-export type TaskSource = 'telegram' | 'mcp' | 'cli';
+export type TaskSource = 'telegram' | 'mcp' | 'cli' | 'a2a';
 export type RoutingMethod = 'default' | 'single' | 'matched' | 'explicit' | 'user_selected';
 
 export interface TaskRow {

@@ -132,6 +132,7 @@ anyagent> events watch
 | `AUDIT_NETWORK` | unset | Log every outbound connection to `network.log`. |
 | `AUDIT_LOG_INTENT` | unset | Set `=1` to store MCP intent text in `audit.log` (default: SHA-256 prefix only). |
 | `AIRGAP` | unset | Refuse non-loopback outbound connections. Fails fast if `BOT_TOKEN` is set. |
+| `A2A_ENABLED` | unset | Set `=1` to serve the A2A Agent Card and `/a2a` JSON-RPC endpoint on `MCP_PORT`. |
 | `AGENT_REVIEW` | `changes` | Quarantine agents whose definition changed until approved with `review`. `all` also quarantines new agents; `off` disables pinning. |
 | `LOG_MAX_BYTES` | `10485760` | Rotation threshold for `hub.log`. |
 | `LOG_MAX_FILES` | `5` | How many rotated files to keep. |

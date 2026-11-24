@@ -17,8 +17,10 @@
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import {
   insertMcpToken, getMcpTokenByHash, getMcpTokenByLabel, listMcpTokens, deleteMcpToken, touchMcpToken,
+  getNodeById, nodeDisplayAlias,
   type McpTokenRow,
 } from './db.js';
+import type { TaskRow } from './types.js';
 
 export interface TokenScope {
   /** Label for the audit trail; "admin" is MCP_TOKEN. */
@@ -102,4 +104,17 @@ export function scopeAllows(scope: TokenScope, name: string, alias: string): boo
 /** May this scope use the short-form tool, where the hub picks the machine? */
 export function scopeAllowsAnyNode(scope: TokenScope, name: string): boolean {
   return scope.agents === '*' || scope.agents.includes(name);
+}
+
+/**
+ * Why a scoped token may not see or act on this task (for the audit log), or
+ * undefined if it may. Callers answer "not found" rather than confirm the
+ * task exists.
+ */
+export function taskOutOfScope(scope: TokenScope, task: Pick<TaskRow, 'agent_name' | 'node_id'>): string | undefined {
+  if (scope.agents === '*') return undefined;
+  const node = task.node_id ? getNodeById(task.node_id) : undefined;
+  const alias = node ? nodeDisplayAlias(node) : '';
+  if (task.agent_name && scopeAllows(scope, task.agent_name, alias)) return undefined;
+  return `out of scope: ${task.agent_name ?? 'unrouted'}@${alias}`;
 }
