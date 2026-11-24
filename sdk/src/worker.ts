@@ -220,6 +220,24 @@ export function createWorker(hubUrl: string, config: WorkerConfig, events: Worke
             console.error('[sdk] Auth failed:', result.error);
             ws.close();
           }
+        } else if (res.id === 10 && res.result) {
+          // Response to declare (id=10). Newer hubs report agents they rejected
+          // or sanitized; surface that here so the worker operator sees it.
+          const result = res.result as {
+            accepted?: string[];
+            rejected?: Array<{ name: string; reason: string }>;
+            sanitized?: Array<{ name: string; fields: string[] }>;
+            pendingReview?: string[];
+          };
+          for (const r of result.rejected ?? []) {
+            console.error(`[sdk] Hub rejected agent "${r.name}": ${r.reason}`);
+          }
+          for (const s of result.sanitized ?? []) {
+            console.warn(`[sdk] Hub sanitized ${s.fields.join(', ')} of agent "${s.name}"`);
+          }
+          for (const name of result.pendingReview ?? []) {
+            console.warn(`[sdk] Agent "${name}" changed since the hub last approved it — hidden until the hub operator runs "review"`);
+          }
         }
         return;
       }

@@ -8,10 +8,6 @@ import {
   deleteExpiredPairCodes,
   insertNode,
   getNodeById,
-  updateNodeName,
-  updateNodeDescription,
-  deleteAgentsByNodeId,
-  upsertAgent,
   upsertSession,
   getSessionByNodeId,
   getSessionByChatId,
@@ -27,6 +23,7 @@ import {
 } from './db.js';
 import { escapeHtml } from './format.js';
 import { emit as emitEvent } from './events.js';
+import { processDeclaration, MAX_AGENTS_PER_NODE } from './declare.js';
 import { incReconnect, incAuthFailure, setWorkersOnline } from './metrics.js';
 import type {
   JsonRpcRequest,
@@ -571,49 +568,23 @@ async function handleMessage(
         sendJson(session.ws, makeError(req.id, -32006, 'Not authenticated'));
         return;
       }
-      const MAX_AGENTS_PER_NODE = 50;
-      const params = req.params as DeclareParams;
-      if ((params.agents?.length ?? 0) > MAX_AGENTS_PER_NODE) {
+      const params = (req.params ?? {}) as DeclareParams;
+      if (Array.isArray(params.agents) && params.agents.length > MAX_AGENTS_PER_NODE) {
         sendJson(session.ws, makeError(req.id, -32602, `Too many agents (max ${MAX_AGENTS_PER_NODE})`));
         return;
       }
-      if (params.name) updateNodeName(session.nodeId, params.name);
-      if (params.description) updateNodeDescription(session.nodeId, params.description);
-
-      // Detect cross-node name collisions BEFORE deleting this node's old
-      // agents, so the log line reflects the true "other nodes already have
-      // this" state. Non-blocking — operators may intentionally run the same
-      // agent on multiple machines as a fleet.
-      const { getAllAgents: dbGetAllAgents, getNodeById: dbGetNodeById } = await import('./db.js');
-      const existingByName = new Map<string, string[]>(); // name → [other node_ids]
-      for (const existing of dbGetAllAgents()) {
-        if (existing.node_id === session.nodeId) continue;
-        if (!existingByName.has(existing.name)) existingByName.set(existing.name, []);
-        existingByName.get(existing.name)!.push(existing.node_id);
-      }
-
-      // Replace all agents for this node only — namespaced by node_id
-      deleteAgentsByNodeId(session.nodeId);
-      for (const agent of params.agents ?? []) {
-        upsertAgent(agent.name, session.nodeId, agent.binary, agent.args ?? [], agent.description, agent.capabilities, agent.contextAware);
-      }
+      // Sanitize + apply to the registry (declare.ts). Rejected or cleaned
+      // agents are reported back so the worker operator sees why.
+      const outcome = processDeclaration(session.nodeId, params);
       const pv = params.protocolVersion ?? 1;
-      console.log(`[gateway] Node ${session.nodeId} declared ${params.agents?.length ?? 0} agent(s), protocol v${pv}`);
+      console.log(`[gateway] Node ${session.nodeId} declared ${outcome.accepted.length} agent(s), protocol v${pv}`);
 
-      // Surface the collision so operators can see MCP will now expose both
-      // short form (ambiguous) and explicit per-node forms. Helpful when a
-      // fresh worker unexpectedly shares a name with an existing one.
-      for (const agent of params.agents ?? []) {
-        const others = existingByName.get(agent.name);
-        if (!others || others.length === 0) continue;
-        const aliases = others
-          .map((id) => dbGetNodeById(id))
-          .filter((n): n is NonNullable<typeof n> => !!n)
-          .map((n) => (n.alias || n.node_id.slice(0, 12)));
-        console.warn(`[gateway] Agent "${agent.name}" on node ${session.nodeId} collides with ${others.length} other node(s): ${aliases.join(', ')}. MCP will expose anyagent_${agent.name}_<alias> for each.`);
-      }
-
-      sendJson(session.ws, makeResult(req.id, { success: true }));
+      sendJson(session.ws, makeResult(req.id, {
+        success: true,
+        accepted: outcome.accepted,
+        ...(outcome.rejected.length ? { rejected: outcome.rejected } : {}),
+        ...(outcome.modified.length ? { sanitized: outcome.modified } : {}),
+      }));
       for (const cb of agentChangeCallbacks) cb();
       break;
     }
