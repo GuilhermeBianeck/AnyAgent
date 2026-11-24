@@ -1,0 +1,49 @@
+# Build every package and run the hub test suite on each push and PR.
+# Release binaries are built separately by release.yml on version tags.
+
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          # node:sqlite needs >= 22.5
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: |
+            hub/package-lock.json
+            sdk/package-lock.json
+            worker/package-lock.json
+
+      - name: SDK — install + build
+        working-directory: sdk
+        run: npm ci && npm run build
+
+      - name: Hub — install + build
+        working-directory: hub
+        run: npm ci && npm run build
+
+      - name: Hub — typecheck tests
+        working-directory: hub
+        run: npm run typecheck:test
+
+      - name: Hub — test
+        working-directory: hub
+        run: npm test
+
+      - name: Worker — install + build
+        working-directory: worker
+        run: npm ci && npm run build

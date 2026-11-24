@@ -66,9 +66,11 @@ db.exec(`
     ws_id TEXT NOT NULL
   );
 
+  -- Agent names are unique per node, not globally (idx_agents_name_node below),
+  -- so the same agent (e.g. "claude") can run on several machines.
   CREATE TABLE IF NOT EXISTS agents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
     node_id TEXT NOT NULL,
     binary TEXT NOT NULL,
     args_json TEXT NOT NULL DEFAULT '[]',
@@ -84,10 +86,48 @@ try { db.exec(`ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT '
 try { db.exec(`ALTER TABLE agents ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN context_aware INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE agents ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
-try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
-// Fix agent name collision: namespace by (name, node_id) instead of name alone
-try { db.exec(`DROP INDEX IF EXISTS sqlite_autoindex_agents_1`); } catch { /* may not exist */ }
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_node ON agents(name, node_id)`); } catch { /* already exists */ }
+// NOTE: `tasks` migrations live below its CREATE TABLE. Running them here would
+// fail silently on a fresh install (no table yet) and leave columns missing.
+
+// Agent names must be unique per (name, node_id), not globally. Databases
+// created before this fix have a column-level `name TEXT UNIQUE`. SQLite cannot
+// drop the index behind a UNIQUE constraint ("index associated with UNIQUE or
+// PRIMARY KEY constraint cannot be dropped"), so the only way out is the
+// standard table rebuild. Runs once; later starts see no such index and skip.
+function agentsHasGlobalNameUnique(): boolean {
+  const indexes = db.prepare(`PRAGMA index_list(agents)`).all<{ name: string; unique: number; origin: string }>();
+  for (const idx of indexes) {
+    if (idx.unique !== 1 || idx.origin !== 'u') continue;
+    const cols = db.prepare(`PRAGMA index_info("${idx.name.replace(/"/g, '""')}")`).all<{ name: string }>();
+    if (cols.length === 1 && cols[0].name === 'name') return true;
+  }
+  return false;
+}
+if (agentsHasGlobalNameUnique()) {
+  const cols = 'id, name, node_id, binary, args_json, created_at, description, capabilities, context_aware, trusted';
+  db.exec(`
+    BEGIN;
+    CREATE TABLE agents_rebuild (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      binary TEXT NOT NULL,
+      args_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      description TEXT NOT NULL DEFAULT '',
+      capabilities TEXT NOT NULL DEFAULT '[]',
+      context_aware INTEGER NOT NULL DEFAULT 1,
+      trusted INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+    );
+    INSERT INTO agents_rebuild (${cols}) SELECT ${cols} FROM agents;
+    DROP TABLE agents;
+    ALTER TABLE agents_rebuild RENAME TO agents;
+    COMMIT;
+  `);
+  console.log('[db] Migrated agents table: names are now unique per node instead of globally');
+}
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_node ON agents(name, node_id)`);
 
 // Session and default agent persistence
 db.exec(`
@@ -125,6 +165,9 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+// `tasks` migrations — must run after the CREATE TABLE above.
+try { db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 
 // Pair code operations
 export function insertPairCode(code: string, expiresAt: Date, wsId: string): void {

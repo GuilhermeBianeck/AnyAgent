@@ -8,7 +8,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node --no-warnings=ExperimentalWarning dist/index.js",
-    "dev": "tsx --no-warnings=ExperimentalWarning src/index.ts"
+    "dev": "tsx --no-warnings=ExperimentalWarning src/index.ts",
+    "test": "node --no-warnings=ExperimentalWarning --import tsx --test --test-reporter=spec test/*.test.ts",
+    "typecheck:test": "tsc --noEmit -p test/tsconfig.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
