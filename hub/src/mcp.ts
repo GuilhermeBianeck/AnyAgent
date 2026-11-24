@@ -1,18 +1,108 @@
-import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { createServer, IncomingMessage, ServerResponse, Server } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { timingSafeEqual } from 'crypto';
-import { getTask } from './db.js';
+import { getTask, getNodeById, nodeDisplayAlias } from './db.js';
 import {
   findAgentByCapability, createTaskId, startAgentForTask,
   getAgentList, getWorkerList, resolveShortFormAgent,
 } from './manager.js';
 import { getContext } from './context.js';
 import type { TaskRow } from './types.js';
-import { insertTask, updateTaskStatus } from './db.js';
+import { insertTask } from './db.js';
 import { getBuildInfo, uptimeSeconds } from './build-info.js';
 import { metricsEnabled, renderMetrics, setWorkersOnline } from './metrics.js';
+
+// ---------------------------------------------------------------------------
+// Tool metadata (AR-1). Annotations let MCP clients tell a read-only status
+// query apart from "run a process on another machine", which is what they use
+// to decide when to ask the user for confirmation.
+// ---------------------------------------------------------------------------
+
+const READ_ONLY: ToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+// Agent tools spawn an arbitrary declared process on a worker machine. We
+// cannot know what it does, so we declare the conservative worst case.
+const RUNS_AGENT: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+const timeoutParam = z.number().int().min(0).max(120000).optional()
+  .describe('Block up to this many ms (max 120000) waiting for the result. Omit for async; poll with anyagent_task_status.');
+
+// Shape shared by every tool that creates or reports on a task.
+const taskOutputShape = {
+  taskId: z.string(),
+  status: z.string().describe('submitted | pending_approval | queued | routed | running | complete | failed | timeout'),
+  agent: z.string().optional(),
+  node: z.string().optional().describe('Alias of the machine the task runs on'),
+  intent: z.string().optional(),
+  result: z.string().optional(),
+  error: z.string().optional(),
+  queuePosition: z.number().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+};
+type TaskOutput = {
+  taskId: string;
+  status: string;
+  agent?: string;
+  node?: string;
+  intent?: string;
+  result?: string;
+  error?: string;
+  queuePosition?: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type ToolResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+};
+
+function nodeAliasFor(nodeId: string | null | undefined): string | undefined {
+  if (!nodeId) return undefined;
+  const node = getNodeById(nodeId);
+  return node ? nodeDisplayAlias(node) : undefined;
+}
+
+// Drop undefined keys so structuredContent round-trips through JSON unchanged.
+function compact<T extends Record<string, unknown>>(obj: T): T {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T;
+}
+
+export function taskToOutput(task: TaskRow): TaskOutput {
+  return compact({
+    taskId: task.task_id,
+    status: task.status,
+    agent: task.agent_name ?? undefined,
+    node: nodeAliasFor(task.node_id),
+    intent: task.intent,
+    result: task.result_summary ?? undefined,
+    error: task.error ?? undefined,
+    createdAt: task.created_at,
+    updatedAt: task.updated_at,
+  });
+}
+
+function textResult(text: string, structured?: Record<string, unknown>, isError?: boolean): ToolResult {
+  const r: ToolResult = { content: [{ type: 'text', text }] };
+  if (structured) r.structuredContent = structured;
+  if (isError) r.isError = true;
+  return r;
+}
 
 type McpTaskCallback = (task: TaskRow) => void;
 let onMcpTaskCallback: McpTaskCallback | null = null;
@@ -33,7 +123,7 @@ async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow |
   return null;
 }
 
-async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+async function handleToolCall(agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string }): Promise<ToolResult> {
   const { getAgentByNameAndAlias } = await import('./db.js');
   // If the caller targeted a specific node via `anyagent_<name>_<alias>`, resolve
   // it that way — never collapse the collision to some other node.
@@ -44,7 +134,7 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
     const hint = options?.explicitAlias
       ? `Agent "${agentName}@${options.explicitAlias}" not found (alias may be stale — try anyagent_list_agents).`
       : `Agent "${agentName}" not found.`;
-    return { content: [{ type: 'text', text: hint }], isError: true };
+    return textResult(hint, undefined, true);
   }
 
   const taskId = createTaskId();
@@ -59,8 +149,15 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
     if (task && onMcpTaskCallback) onMcpTaskCallback(task);
   }
 
+  const current = (): TaskOutput => {
+    const t = getTask(taskId);
+    return t
+      ? taskToOutput(t)
+      : { taskId, status: 'failed', agent: result.agentName, node: result.nodeAlias };
+  };
+
   if (result.outcome === 'failed' || result.outcome === 'offline' || result.outcome === 'queue_full') {
-    return { content: [{ type: 'text', text: `Failed: ${result.error ?? result.outcome}` }], isError: true };
+    return textResult(`Failed: ${result.error ?? result.outcome}`, current(), true);
   }
 
   // Blocking mode
@@ -68,13 +165,13 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
     const completed = await waitForTask(taskId, timeoutMs);
     const ranOn = result.nodeAlias ? ` (${result.agentName}@${result.nodeAlias})` : '';
     if (completed) {
+      const out = taskToOutput(completed);
       if (completed.status === 'complete') {
-        const text = completed.result_summary ?? `Task completed${ranOn}.`;
-        return { content: [{ type: 'text', text }] };
+        return textResult(completed.result_summary ?? `Task completed${ranOn}.`, out);
       }
-      return { content: [{ type: 'text', text: `Task failed${ranOn}: ${completed.error ?? 'unknown'}` }], isError: true };
+      return textResult(`Task failed${ranOn}: ${completed.error ?? 'unknown'}`, out, true);
     }
-    return { content: [{ type: 'text', text: `Task ${taskId}${ranOn} still running after ${timeoutMs}ms. Use anyagent_task_status to check.` }] };
+    return textResult(`Task ${taskId}${ranOn} still running after ${timeoutMs}ms. Use anyagent_task_status to check.`, current());
   }
 
   // Async mode — echo the resolved node so the operator sees WHICH machine
@@ -85,20 +182,84 @@ async function handleToolCall(agentName: string, intent: string, timeoutMs: numb
     : result.outcome === 'pending_approval'
     ? `Task ${taskId} pending approval for ${target}.`
     : `Task ${taskId} started on ${target}.`;
-  return { content: [{ type: 'text', text: `${statusMsg} Use anyagent_task_status to check.` }] };
+  const out = current();
+  if (result.queuePosition !== undefined) out.queuePosition = result.queuePosition;
+  return textResult(`${statusMsg} Use anyagent_task_status to check.`, out);
 }
 
 // --- Tool registration functions ---
 
-function registerStaticTools(server: McpServer): void {
-  server.tool(
+// MCP tool names must be `[a-zA-Z0-9_-]`. Worker-declared names are validated
+// on declare, but we still defensively strip anything unusual here.
+function mcpSafe(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+export function shortToolName(agentName: string): string {
+  return `anyagent_${mcpSafe(agentName)}`;
+}
+
+export function explicitToolName(agentName: string, nodeAlias: string): string {
+  return `anyagent_${mcpSafe(agentName)}_${mcpSafe(nodeAlias)}`;
+}
+
+/**
+ * Registers tools while refusing duplicates. Two different agents can map to
+ * the same MCP name (agent `claude` on node `spot` and an agent literally
+ * called `claude_spot`), and the SDK throws on a duplicate — which would fail
+ * every MCP request, not just the clashing tool. First registration wins.
+ */
+class ToolRegistry {
+  private readonly names = new Set<string>();
+  constructor(readonly server: McpServer) {}
+  claim(name: string): boolean {
+    if (this.names.has(name)) {
+      console.warn(`[mcp] Tool name "${name}" is already registered — skipping duplicate`);
+      return false;
+    }
+    this.names.add(name);
+    return true;
+  }
+}
+
+function registerStaticTools(reg: ToolRegistry): void {
+  const server = reg.server;
+  reg.claim('anyagent_list_agents');
+  server.registerTool(
     'anyagent_list_agents',
-    'List all registered agents grouped by machine, with online/offline status.',
-    {},
+    {
+      title: 'List agents',
+      description: 'List all registered agents grouped by machine, with online/offline status and the MCP tool name for each.',
+      annotations: READ_ONLY,
+      outputSchema: {
+        agents: z.array(z.object({
+          name: z.string(),
+          node: z.string().describe('Machine alias'),
+          nodeName: z.string(),
+          online: z.boolean(),
+          description: z.string(),
+          capabilities: z.array(z.string()),
+          tool: z.string().describe('Short-form tool; the hub picks the machine'),
+          explicitTool: z.string().describe('Tool that always targets this machine'),
+        })),
+      },
+    },
     async () => {
       const agents = getAgentList();
+      const structured = {
+        agents: agents.map(a => ({
+          name: a.name,
+          node: a.nodeAlias,
+          nodeName: a.nodeName,
+          online: a.online,
+          description: a.description,
+          capabilities: a.capabilities,
+          tool: shortToolName(a.name),
+          explicitTool: explicitToolName(a.name, a.nodeAlias),
+        })),
+      };
       if (agents.length === 0) {
-        return { content: [{ type: 'text' as const, text: 'No agents registered.' }] };
+        return textResult('No agents registered.', structured);
       }
 
       // Group by nodeAlias so the user can see which agents live on which machine.
@@ -131,73 +292,81 @@ function registerStaticTools(server: McpServer): void {
       lines.push('');
       lines.push('Call short form (hub picks the node):  anyagent_<name>');
       lines.push('Call a specific machine:               anyagent_<name>_<alias>');
-      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+      return textResult(lines.join('\n'), structured);
     }
   );
 
-  server.tool(
+  reg.claim('anyagent_route');
+  server.registerTool(
     'anyagent_route',
-    'Route a task to the best available agent. Set timeout_ms to wait for the result.',
     {
-      intent: z.string().describe('Natural language description of what you want done'),
-      timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms (max 120000) waiting for result. Omit for async.'),
+      title: 'Route task to best agent',
+      description: 'Route a task to the best available agent by capability. Runs a process on a worker machine. Set timeout_ms to wait for the result.',
+      annotations: RUNS_AGENT,
+      inputSchema: {
+        intent: z.string().describe('Natural language description of what you want done'),
+        timeout_ms: timeoutParam,
+      },
+      outputSchema: taskOutputShape,
     },
     async ({ intent, timeout_ms }) => {
       const routing = findAgentByCapability(intent);
       if (routing.type === 'none') {
-        return { content: [{ type: 'text' as const, text: 'No online agents available.' }], isError: true };
+        return textResult('No online agents available.', undefined, true);
       }
       // For MCP, if ambiguous pick first match (no interactive selection)
       const agent = routing.agent ?? routing.agents?.[0];
       if (!agent) {
-        return { content: [{ type: 'text' as const, text: 'No matching agent found.' }], isError: true };
+        return textResult('No matching agent found.', undefined, true);
       }
       return handleToolCall(agent.name, intent, timeout_ms, 'matched');
     }
   );
 
-  server.tool(
+  reg.claim('anyagent_task_status');
+  server.registerTool(
     'anyagent_task_status',
-    'Check the status and result of a task by ID',
-    { task_id: z.string().describe('The task ID returned by anyagent_route or anyagent_<agent>') },
+    {
+      title: 'Task status',
+      description: 'Check the status and result of a task by ID.',
+      annotations: READ_ONLY,
+      inputSchema: { task_id: z.string().describe('The task ID returned by anyagent_route or anyagent_<agent>') },
+      outputSchema: taskOutputShape,
+    },
     async ({ task_id }) => {
       const task = getTask(task_id);
       if (!task) {
-        return { content: [{ type: 'text' as const, text: `Task ${task_id} not found.` }], isError: true };
+        return textResult(`Task ${task_id} not found.`, undefined, true);
       }
       // Surface WHICH machine the task ran on so the operator knows which
       // worker to look at for logs, CLI state, etc. when they didn't pick.
-      let onNode = '';
-      if (task.node_id) {
-        const { getNodeById, nodeDisplayAlias } = await import('./db.js');
-        const node = getNodeById(task.node_id);
-        if (node) onNode = `@${nodeDisplayAlias(node)}`;
-      }
+      const out = taskToOutput(task);
+      const onNode = out.node ? `@${out.node}` : '';
       let text = `Task: ${task.task_id}\nStatus: ${task.status}\nAgent: ${task.agent_name ? task.agent_name + onNode : 'none'}\nIntent: ${task.intent}`;
       if (task.result_summary) text += `\nResult: ${task.result_summary}`;
       if (task.error) text += `\nError: ${task.error}`;
-      return { content: [{ type: 'text' as const, text }] };
+      return textResult(text, out);
     }
   );
 
-  server.tool(
+  reg.claim('anyagent_context');
+  server.registerTool(
     'anyagent_context',
-    'Read the operator\'s persistent context (environment info, preferences, notes)',
-    {},
+    {
+      title: 'Operator context',
+      description: 'Read the operator\'s persistent context (environment info, preferences, notes).',
+      annotations: READ_ONLY,
+      outputSchema: { context: z.string() },
+    },
     async () => {
       const ctx = getContext();
-      return { content: [{ type: 'text' as const, text: ctx || 'No operator context set.' }] };
+      return textResult(ctx || 'No operator context set.', { context: ctx ?? '' });
     }
   );
 }
 
-// MCP tool names must be `[a-zA-Z0-9_-]`. Worker-declared names already come
-// from a sanitised JSON, but we still defensively strip anything unusual here.
-function mcpSafe(s: string): string {
-  return s.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
-function registerDynamicAgentTools(server: McpServer): void {
+function registerDynamicAgentTools(reg: ToolRegistry): void {
+  const server = reg.server;
   const agents = getAgentList();
 
   // ---- Short-form tools (one per distinct agent NAME, regardless of node) ----
@@ -212,17 +381,24 @@ function registerDynamicAgentTools(server: McpServer): void {
   }
 
   for (const [name, variants] of byName.entries()) {
+    const toolName = shortToolName(name);
+    if (!reg.claim(toolName)) continue;
     const caps = variants[0].capabilities.length > 0 ? ` [${variants[0].capabilities.join(', ')}]` : '';
     const nodeCount = variants.length;
     const nodeHint = nodeCount > 1
-      ? ` (available on ${nodeCount} machines: ${variants.map(v => v.nodeAlias).sort().join(', ')} — hub picks the oldest online pairing by default; use anyagent_${mcpSafe(name)}_<alias> to target a specific one)`
+      ? ` (available on ${nodeCount} machines: ${variants.map(v => v.nodeAlias).sort().join(', ')} — hub picks the oldest online pairing by default; use ${toolName}_<alias> to target a specific one)`
       : '';
-    server.tool(
-      `anyagent_${mcpSafe(name)}`,
-      `${variants[0].description || name}${caps}${nodeHint}`,
+    server.registerTool(
+      toolName,
       {
-        intent: z.string().describe('What you want this agent to do'),
-        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms waiting for result. Omit for async.'),
+        title: name,
+        description: `${variants[0].description || name}${caps}${nodeHint}`,
+        annotations: RUNS_AGENT,
+        inputSchema: {
+          intent: z.string().describe('What you want this agent to do'),
+          timeout_ms: timeoutParam,
+        },
+        outputSchema: taskOutputShape,
       },
       async ({ intent, timeout_ms }) => {
         return handleToolCall(name, intent, timeout_ms, 'explicit');
@@ -236,15 +412,21 @@ function registerDynamicAgentTools(server: McpServer): void {
   // the recommended form when more than one node has an agent with the same
   // name — the short form falls back to the picker, which can surprise you.
   for (const a of agents) {
-    const toolName = `anyagent_${mcpSafe(a.name)}_${mcpSafe(a.nodeAlias)}`;
+    const toolName = explicitToolName(a.name, a.nodeAlias);
+    if (!reg.claim(toolName)) continue;
     const caps = a.capabilities.length > 0 ? ` [${a.capabilities.join(', ')}]` : '';
     const nodeName = a.nodeName && a.nodeName !== a.nodeAlias ? ` (${a.nodeName})` : '';
-    server.tool(
+    server.registerTool(
       toolName,
-      `${a.description || a.name} on ${a.nodeAlias}${nodeName}${caps}`,
       {
-        intent: z.string().describe('What you want this agent to do'),
-        timeout_ms: z.number().max(120000).optional().describe('Block up to this many ms waiting for result. Omit for async.'),
+        title: `${a.name} on ${a.nodeAlias}`,
+        description: `${a.description || a.name} on ${a.nodeAlias}${nodeName}${caps}`,
+        annotations: RUNS_AGENT,
+        inputSchema: {
+          intent: z.string().describe('What you want this agent to do'),
+          timeout_ms: timeoutParam,
+        },
+        outputSchema: taskOutputShape,
       },
       async ({ intent, timeout_ms }) => {
         return handleToolCall(a.name, intent, timeout_ms, 'explicit', { explicitAlias: a.nodeAlias });
@@ -253,9 +435,21 @@ function registerDynamicAgentTools(server: McpServer): void {
   }
 }
 
+/** Build a fully-registered MCP server instance (one per HTTP request). */
+export function buildMcpServer(): McpServer {
+  const server = new McpServer(
+    { name: 'anyagent-hub', title: 'AnyAgent', version: getBuildInfo().version },
+    { capabilities: { tools: {} } }
+  );
+  const reg = new ToolRegistry(server);
+  registerStaticTools(reg);
+  registerDynamicAgentTools(reg);
+  return server;
+}
+
 // --- HTTP Server ---
 
-export function createMcpServer(mcpPort: number, mcpToken: string): void {
+export function createMcpServer(mcpPort: number, mcpToken: string): Server {
   const MAX_BODY_SIZE = 1_048_576;
   const expectedToken = Buffer.from(`Bearer ${mcpToken}`);
 
@@ -346,19 +540,16 @@ export function createMcpServer(mcpPort: number, mcpToken: string): void {
       }
     }
 
-    const server = new McpServer(
-      { name: 'anyagent-hub', version: '2.0.0' },
-      { capabilities: { tools: {} } }
-    );
-    registerStaticTools(server);
-    registerDynamicAgentTools(server);
-
+    const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
     await transport.handleRequest(req, res, parsed);
   });
 
   httpServer.listen(mcpPort, () => {
-    console.log(`[mcp] MCP server listening on port ${mcpPort}`);
+    const addr = httpServer.address();
+    const port = typeof addr === 'object' && addr ? addr.port : mcpPort;
+    console.log(`[mcp] MCP server listening on port ${port}`);
   });
+  return httpServer;
 }
