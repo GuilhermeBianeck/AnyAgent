@@ -4,11 +4,14 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { getTask, getNodeById, nodeDisplayAlias } from './db.js';
-import { ADMIN_SCOPE, resolveBearer, scopeAllows, scopeAllowsAnyNode, type TokenScope } from './tokens.js';
+import {
+  ADMIN_SCOPE, resolveBearer, scopeAllows, scopeAllowsAnyNode, taskOutOfScope as taskOutOfScopeFor,
+  type TokenScope,
+} from './tokens.js';
 import type { AgentRow } from './types.js';
 import {
   findAgentByCapability, createTaskId, startAgentForTask,
-  getAgentList, getWorkerList, resolveShortFormAgent, cancelTask,
+  getAgentList, getWorkerList, resolveShortFormAgent, cancelTask, waitForTerminal,
 } from './manager.js';
 import { getContext } from './context.js';
 import type { TaskRow, OutputParams } from './types.js';
@@ -53,6 +56,7 @@ function describeOutput(p: OutputParams): string | undefined {
 import { getBuildInfo, uptimeSeconds } from './build-info.js';
 import { metricsEnabled, renderMetrics, setWorkersOnline } from './metrics.js';
 import { recordMcpCall } from './audit.js';
+import { a2aEnabled, buildAgentCard, handleA2aRpc, AGENT_CARD_PATH, A2A_RPC_PATH, A2A_PROTOCOL_VERSION } from './a2a.js';
 
 // ---------------------------------------------------------------------------
 // Tool metadata (AR-1). Annotations let MCP clients tell a read-only status
@@ -186,17 +190,7 @@ export function onMcpTask(callback: McpTaskCallback): void {
   onMcpTaskCallback = callback;
 }
 
-async function waitForTask(taskId: string, timeoutMs: number): Promise<TaskRow | null> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const task = getTask(taskId);
-    if (task && isTerminalStatus(task.status)) {
-      return task;
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  return null;
-}
+const waitForTask = waitForTerminal;
 
 // Results refused by token scope. Tracked out-of-band so the audit wrapper can
 // record outcome "denied" without adding fields to what the client receives.
@@ -212,13 +206,7 @@ function aliasOf(agent: AgentRow): string {
   return nodeAliasFor(agent.node_id) ?? agent.node_id.replace(/^node_/, '').slice(0, 8);
 }
 
-/** Why a scoped token may not see/act on this task, or undefined if it may. */
-function taskOutOfScope(scope: TokenScope, task: TaskRow): string | undefined {
-  if (scope.agents === '*') return undefined;
-  const alias = nodeAliasFor(task.node_id) ?? '';
-  if (task.agent_name && scopeAllows(scope, task.agent_name, alias)) return undefined;
-  return `out of scope: ${task.agent_name ?? 'unrouted'}@${alias}`;
-}
+const taskOutOfScope = taskOutOfScopeFor;
 
 async function handleToolCall(scope: TokenScope, agentName: string, intent: string, timeoutMs: number | undefined, routingMethod: 'matched' | 'explicit', options?: { explicitAlias?: string; progress?: ProgressFn }): Promise<ToolResult> {
   const { getAgentByNameAndAlias } = await import('./db.js');
@@ -696,6 +684,16 @@ export function createMcpServer(mcpPort: number, adminToken?: string): Server {
       return;
     }
 
+    // A2A discovery (AR-8, opt-in). Agent Cards are fetched without auth by
+    // design; the RPC endpoint they point to requires a token.
+    const path = url.split('?')[0];
+    if (a2aEnabled() && method === 'GET' && path === AGENT_CARD_PATH) {
+      const base = (process.env.A2A_PUBLIC_URL ?? `http://${req.headers.host ?? `localhost:${mcpPort}`}`).replace(/\/+$/, '');
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=60' });
+      res.end(JSON.stringify(buildAgentCard(base)));
+      return;
+    }
+
     if (method === 'GET' && url === '/metrics') {
       if (!metricsEnabled()) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -744,6 +742,18 @@ export function createMcpServer(mcpPort: number, adminToken?: string): Server {
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
         return;
       }
+    }
+
+    if (a2aEnabled() && path === A2A_RPC_PATH) {
+      if (method !== 'POST') {
+        res.writeHead(405, { Allow: 'POST', 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Method not allowed' }));
+        return;
+      }
+      const reply = await handleA2aRpc(scope, parsed);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'A2A-Version': A2A_PROTOCOL_VERSION });
+      res.end(JSON.stringify(reply));
+      return;
     }
 
     const server = buildMcpServer(scope);

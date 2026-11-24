@@ -263,7 +263,19 @@ Plus: inline buttons for pairing approval, task approval/deny/trust, retry, canc
 | `SESSION_TIMEOUT_MS` | `1800000` | Inactivity timeout (30 min) |
 | `MAX_QUEUE_DEPTH` | `3` | Max queued tasks per worker |
 | `AUTO_APPROVE_LOOPBACK` | — | Set `=1` to auto-approve pair requests from `127.0.0.1`/`::1`. Used by `quickstart.sh`; ignored for non-loopback connections. |
+| `A2A_ENABLED` | — | Set `=1` to publish an A2A v1.0 Agent Card at `/.well-known/agent-card.json` and accept A2A JSON-RPC at `/a2a` on `MCP_PORT`. |
+| `A2A_PUBLIC_URL` | `http://<Host header>` | Base URL advertised in the Agent Card (set this behind a reverse proxy). |
+| `A2A_WAIT_MS` | `60000` | How long `SendMessage` waits for the agent before returning a working task (max 120000). |
 | `AGENT_REVIEW` | `changes` | Agent definition pinning. `changes`: an agent whose binary, args, description or capabilities change is hidden until you approve it with `review`. `all`: new agents need review too. `off`: accept changes automatically. |
+
+### A2A (Agent2Agent), opt-in
+
+With `A2A_ENABLED=1`, other agents and orchestrators that speak [A2A v1.0](https://github.com/a2aproject/A2A) can discover and delegate to your fleet:
+
+- `GET /.well-known/agent-card.json` lists one skill per `agent@machine`, plus `route` (the hub picks by capability). Quarantined agents are never listed.
+- `POST /a2a` implements the JSON-RPC binding: `SendMessage`, `GetTask` and `CancelTask`. It uses the same bearer tokens as MCP, so scoped tokens apply. To pick an agent, set `metadata.skillId` to `claude@laptop`, `claude`, or `route` (the default).
+
+`SendMessage` waits up to `A2A_WAIT_MS` for the result (returned as a `result` artifact). With `configuration.returnImmediately: true` it returns at once; poll with `GetTask`. Calls appear in the audit log as `a2a.<Method>`. Tested against the official `@a2a-js/sdk` client.
 
 ### Scoped MCP tokens
 

@@ -259,6 +259,17 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
   }
 }
 
+/** Poll until a task reaches a terminal state, or null on timeout. */
+export async function waitForTerminal(taskId: string, timeoutMs: number, pollMs = 250): Promise<TaskRow | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const task = getTask(taskId);
+    if (task && isTerminalStatus(task.status)) return task;
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+  return null;
+}
+
 // --- Cancellation (AR-6) ---
 
 export interface CancelResult {
