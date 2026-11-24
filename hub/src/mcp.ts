@@ -1,7 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse, Server } from 'http';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
+// MCP SDK v2: serves 2026-07-28 (stateless core) clients natively and older
+// (2025-11-25 and earlier) clients through its stateless legacy fallback (AR-7).
+import { McpServer, createMcpHandler, type ToolAnnotations, type ServerContext, type AuthInfo } from '@modelcontextprotocol/server';
+import { toNodeHandler } from '@modelcontextprotocol/node';
 import { z } from 'zod';
 import { getTask, getNodeById, nodeDisplayAlias } from './db.js';
 import {
@@ -18,10 +19,8 @@ import type { TaskRow, OutputParams } from './types.js';
 import { isTerminalStatus } from './types.js';
 import { insertTask } from './db.js';
 import { onStructuredOutput } from './gateway.js';
-import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sdk/types.js';
 
-type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+type ToolExtra = ServerContext;
 type ProgressFn = (message: string) => void;
 
 /**
@@ -29,12 +28,12 @@ type ProgressFn = (message: string) => void;
  * sending a progressToken. The spec requires `progress` to strictly increase,
  * so it counts updates; the human-readable state goes in `message`.
  */
-function progressReporter(extra: ToolExtra | undefined): ProgressFn | undefined {
-  const token = extra?._meta?.progressToken;
-  if (token === undefined || !extra) return undefined;
+function progressReporter(ctx: ToolExtra | undefined): ProgressFn | undefined {
+  const token = ctx?.mcpReq._meta?.progressToken;
+  if (token === undefined || !ctx) return undefined;
   let seq = 0;
   return (message: string) => {
-    extra.sendNotification({
+    ctx.mcpReq.notify({
       method: 'notifications/progress',
       params: { progressToken: token, progress: ++seq, message },
     }).catch(() => { /* client went away */ });
@@ -376,7 +375,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       title: 'List agents',
       description: 'List all registered agents grouped by machine, with online/offline status and the MCP tool name for each.',
       annotations: READ_ONLY,
-      outputSchema: {
+      outputSchema: z.object({
         agents: z.array(z.object({
           name: z.string(),
           node: z.string().describe('Machine alias'),
@@ -387,7 +386,7 @@ function registerStaticTools(reg: ToolRegistry): void {
           tool: z.string().describe('Short-form tool; the hub picks the machine'),
           explicitTool: z.string().describe('Tool that always targets this machine'),
         })),
-      },
+      }),
     },
     reg.handlerNoArgs('anyagent_list_agents', async () => {
       const agents = getAgentList().filter(a => scopeAllows(scope, a.name, a.nodeAlias));
@@ -535,7 +534,7 @@ function registerStaticTools(reg: ToolRegistry): void {
       title: 'Operator context',
       description: 'Read the operator\'s persistent context (environment info, preferences, notes).',
       annotations: READ_ONLY,
-      outputSchema: { context: z.string() },
+      outputSchema: z.object({ context: z.string() }),
     },
     reg.handlerNoArgs('anyagent_context', async () => {
       const ctx = getContext();
@@ -635,6 +634,13 @@ export function buildMcpServer(ctx: TokenScope = ADMIN_SCOPE): McpServer {
 
 let running = false;
 
+const DENY_ALL: TokenScope = { token: 'unknown', agents: [], readonly: true };
+
+function scopeFromAuth(authInfo: AuthInfo | undefined): TokenScope {
+  // Set by our own auth gate below; if it is ever missing, fail closed.
+  return (authInfo?.extra?.anyagentScope as TokenScope | undefined) ?? DENY_ALL;
+}
+
 /** Whether the MCP HTTP server was started in this process. */
 export function mcpServerRunning(): boolean {
   return running;
@@ -648,6 +654,16 @@ export function mcpServerRunning(): boolean {
 export function createMcpServer(mcpPort: number, adminToken?: string): Server {
   const MAX_BODY_SIZE = 1_048_576;
   running = true;
+
+  // One handler for the process. It speaks MCP 2026-07-28 (stateless core,
+  // server/discover, per-request _meta) and, via `legacy: 'stateless'`, keeps
+  // serving 2025-11-25-and-earlier clients that still send `initialize`. The
+  // factory builds a server per request, scoped to the caller's token.
+  const mcpHandler = createMcpHandler(
+    (ctx) => buildMcpServer(scopeFromAuth(ctx.authInfo)),
+    { legacy: 'stateless', maxRequestBodySize: MAX_BODY_SIZE, onerror: (e) => console.error('[mcp]', e.message) },
+  );
+  const nodeHandler = toNodeHandler(mcpHandler, { maxRequestBodySize: MAX_BODY_SIZE });
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     // ---- Unauthenticated liveness / readiness / metrics endpoints ----
@@ -756,10 +772,15 @@ export function createMcpServer(mcpPort: number, adminToken?: string): Server {
       return;
     }
 
-    const server = buildMcpServer(scope);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    await server.connect(transport);
-    await transport.handleRequest(req, res, parsed);
+    // Hand the resolved scope to the per-request server factory via AuthInfo.
+    const auth: AuthInfo = {
+      token: '', // never forwarded; the scope below is what the factory needs
+      clientId: scope.token,
+      scopes: scope.readonly ? ['read'] : ['read', 'run'],
+      extra: { anyagentScope: scope },
+    };
+    (req as IncomingMessage & { auth?: AuthInfo }).auth = auth;
+    await nodeHandler(req, res, parsed);
   });
 
   httpServer.listen(mcpPort, () => {
