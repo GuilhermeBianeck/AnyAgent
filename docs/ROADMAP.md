@@ -10,6 +10,8 @@
 
 **Competitor to beat:** MCPJungle (941 GitHub stars, Go-based MCP gateway/registry). They aggregate existing MCP servers. We wrap arbitrary processes into MCP tools. Different but adjacent.
 
+> **Status, November 2026.** The window above has closed for Claude-only users: Anthropic shipped Remote Control (Feb) and self-hosted environments with cross-session messaging (Aug). The model-agnostic, self-hosted position remains open. The November requirements refresh ([`REQUIREMENTS-2026-11.md`](REQUIREMENTS-2026-11.md)) shipped MCP 2026-07-28 support, agent definition pinning, scoped tokens, an MCP audit log, task cancel/progress, and A2A, which brings Phase 6.2 forward. Checkboxes below are updated where the code confirms them.
+
 ---
 
 ## Phase 0: Ship & Distribute (Weeks 1-2)
@@ -48,10 +50,10 @@
 **Goal:** 4-5x the addressable market by making Telegram optional.
 
 ### 1.1 — CLI management mode
-- [ ] `anyagent-hub --mode cli` starts without Telegram
-- [ ] CLI shows: worker status, agent list, task history, live logs
-- [ ] Pairing via CLI: hub prints code, worker connects, hub auto-approves (or prompts in terminal)
-- [ ] All functionality available without BOT_TOKEN
+- [x] Hub starts without Telegram (no `--mode` flag needed: the CLI always runs; Telegram only when `BOT_TOKEN` is set)
+- [x] CLI shows: worker status, agent list, task history, live logs (`workers`, `agents`, `tasks`/`history`, `events watch`)
+- [x] Pairing via CLI: hub prints code, worker connects, hub prompts in terminal (or auto-approves loopback with `AUTO_APPROVE_LOOPBACK=1`)
+- [x] All functionality available without BOT_TOKEN
 
 ### 1.2 — Make Telegram a plugin, not core
 - [ ] Refactor bot.ts into a separate module imported only when BOT_TOKEN is set
@@ -149,14 +151,14 @@
 - [ ] MCP server on HTTPS
 
 ### 6.2 — A2A protocol support
-- [ ] Hub publishes A2A Agent Card describing aggregate capabilities
-- [ ] Other A2A-speaking agents can discover and delegate to AnyAgent
-- [ ] Positions AnyAgent at the intersection of MCP (tool calling) and A2A (agent coordination)
+- [x] Hub publishes A2A Agent Card describing aggregate capabilities (`A2A_ENABLED=1`, Nov 2026)
+- [x] Other A2A-speaking agents can discover and delegate to AnyAgent (`SendMessage`/`GetTask`/`CancelTask`)
+- [x] Positions AnyAgent at the intersection of MCP (tool calling) and A2A (agent coordination)
 
 ### 6.3 — Multi-user
 - [ ] Replace single ALLOWED_USER_ID with users table
 - [ ] Roles: admin, operator, viewer
-- [ ] Scoped MCP tokens per user
+- [ ] Scoped MCP tokens per user *(scoped tokens with agent allowlists and read-only mode shipped Nov 2026; not yet tied to users or roles)*
 
 ---
 
