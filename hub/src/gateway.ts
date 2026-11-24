@@ -301,7 +301,7 @@ export function createGateway(
               clearActiveSession(disconnectedNodeId);
               for (const cb of sessionEndCallbacks) cb(disconnectedNodeId, 1);
             }
-          }, 60_000);
+          }, 60_000).unref();
         }
       }
       sessions.delete(connId);
@@ -310,7 +310,7 @@ export function createGateway(
 
   // Session timeout checker — clean up abandoned sessions
   const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS ?? '', 10) || 30 * 60 * 1000;
-  setInterval(() => {
+  const timeoutSweep = setInterval(() => {
     const allSessions = getAllSessions();
     const now = Date.now();
     for (const row of allSessions) {
@@ -338,6 +338,10 @@ export function createGateway(
       }
     }
   }, 60_000);
+  // The WebSocket server keeps the process alive; this sweep should not, so
+  // the gateway can be shut down cleanly (tests, graceful stop).
+  timeoutSweep.unref();
+  wss.on('close', () => clearInterval(timeoutSweep));
 
   console.log(`[gateway] WebSocket server listening on port ${port}`);
   return wss;

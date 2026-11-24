@@ -72,8 +72,12 @@ export function createTaskId(): string {
 
 // --- Agent routing (shared by bot.ts, cli.ts, mcp.ts) ---
 
-export function findAgentByCapability(intent: string): RoutingResult {
-  const agents = getAllAgents();
+/**
+ * Pick an agent by capability keywords. `allow` restricts the candidate set
+ * (e.g. to the agents a scoped MCP token may call).
+ */
+export function findAgentByCapability(intent: string, allow?: (agent: AgentRow) => boolean): RoutingResult {
+  const agents = getAllAgents().filter(a => !allow || allow(a));
   const onlineAgents = agents.filter(a => isNodeOnline(a.node_id));
   if (onlineAgents.length === 0) return { type: 'none', method: 'matched' };
   if (onlineAgents.length === 1) return { type: 'single', agent: onlineAgents[0], method: 'single' };

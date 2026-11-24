@@ -230,6 +230,7 @@ anyagent> route fix the authentication bug
 | `events [watch]` | Recent worker/task events, or tail live |
 | `net` | Recent outbound connections (requires `AUDIT_NETWORK=1`) |
 | `audit [n]` | Recent MCP tool calls: token, tool, `agent@node`, outcome (full log in `hub/logs/audit.log`) |
+| `token create <label> [--agents a,b@alias] [--readonly]` | Scoped MCP token (shown once). `token list`, `token revoke <label>` |
 | `status` | Current status |
 
 Any unrecognized text is forwarded as input to the active agent session.
@@ -255,11 +256,27 @@ Plus: inline buttons for pairing approval, task approval/deny/trust, retry, canc
 | `WS_PORT` | `8080` | WebSocket port for workers |
 | `WS_SECRET` | — | Shared secret for worker auth (recommended) |
 | `MCP_PORT` | `3000` | MCP HTTP server port |
-| `MCP_TOKEN` | — | MCP bearer token. Omit to disable MCP server. |
+| `MCP_TOKEN` | — | Full-access ("admin") MCP bearer token. The MCP server starts if this is set or any scoped token exists. |
 | `SESSION_TIMEOUT_MS` | `1800000` | Inactivity timeout (30 min) |
 | `MAX_QUEUE_DEPTH` | `3` | Max queued tasks per worker |
 | `AUTO_APPROVE_LOOPBACK` | — | Set `=1` to auto-approve pair requests from `127.0.0.1`/`::1`. Used by `quickstart.sh`; ignored for non-loopback connections. |
 | `AGENT_REVIEW` | `changes` | Agent definition pinning. `changes`: an agent whose binary, args, description or capabilities change is hidden until you approve it with `review`. `all`: new agents need review too. `off`: accept changes automatically. |
+
+### Scoped MCP tokens
+
+`MCP_TOKEN` can call everything. To give an MCP client less, create a scoped token in the hub CLI:
+
+```
+anyagent> token create cursor-laptop --agents claude@laptop
+anyagent> token create dashboard --readonly
+anyagent> token create claude-anywhere --agents claude
+```
+
+- `claude@laptop` allows only that machine's agent (only the explicit `anyagent_claude_laptop` tool is listed).
+- `claude` allows that agent on any machine, including the short-form `anyagent_claude`.
+- `--readonly` lists agents and reads task status, but cannot run anything.
+
+The client only sees tools it may call. `anyagent_route` picks only from in-scope agents. `anyagent_task_status` answers "not found" for tasks it may not see. Tokens are stored as SHA-256 hashes and shown once. Every call is recorded in `hub/logs/audit.log` under the token's label. Tokens are managed from the CLI only, so they never end up in Telegram chat history.
 
 ### Agent definition pinning
 
