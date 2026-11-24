@@ -9,6 +9,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'crypto';
 import type { NodeRow, PairCodeRow, AgentRow, SessionRow, DefaultAgentRow, TaskRow, TaskStatus, TaskSource, RoutingMethod } from './types.js';
 import { incTask } from './metrics.js';
 import { emit as emitEvent } from './events.js';
@@ -128,6 +129,11 @@ if (agentsHasGlobalNameUnique()) {
   console.log('[db] Migrated agents table: names are now unique per node instead of globally');
 }
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_node ON agents(name, node_id)`);
+// Definition pinning (AR-3). Legacy rows get '' for both hashes, which counts
+// as approved; the next declare pins them (trust on first use).
+try { db.exec(`ALTER TABLE agents ADD COLUMN definition_hash TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN approved_hash TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE agents ADD COLUMN approved_json TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
 
 // Session and default agent persistence
 db.exec(`
@@ -289,13 +295,116 @@ export function getNodeByAlias(alias: string): NodeRow | undefined {
   }
 })();
 
+// ---------------------------------------------------------------------------
 // Agent operations
+//
+// Every read below returns APPROVED agents only (definition_hash =
+// approved_hash). Quarantined agents (AR-3) are therefore invisible to MCP,
+// routing, Telegram and the CLI without each caller having to remember a
+// filter. The review flow uses the explicit *AnyState / pending functions.
+// ---------------------------------------------------------------------------
+
+const APPROVED = `definition_hash = approved_hash`;
+
+/** The parts of an agent that, if changed, require operator re-review. */
+export interface AgentDefinition {
+  binary: string;
+  args: string[];
+  description: string;
+  capabilities: string[];
+  contextAware: boolean;
+}
+
+export function definitionJson(def: AgentDefinition): string {
+  // Fixed key order so the hash is stable across runs.
+  return JSON.stringify({
+    binary: def.binary,
+    args: def.args,
+    description: def.description,
+    capabilities: def.capabilities,
+    contextAware: def.contextAware,
+  });
+}
+
+export function definitionHash(def: AgentDefinition): string {
+  return createHash('sha256').update(definitionJson(def)).digest('hex');
+}
+
+export function rowDefinition(row: AgentRow): AgentDefinition {
+  return {
+    binary: row.binary,
+    args: JSON.parse(row.args_json || '[]'),
+    description: row.description,
+    capabilities: JSON.parse(row.capabilities || '[]'),
+    contextAware: row.context_aware !== 0,
+  };
+}
+
+/**
+ * Operator-level upsert: the definition is stored already approved. Used for
+ * seeding and tests; worker declarations go through insertDeclaredAgent /
+ * updateDeclaredAgent so pinning applies.
+ */
 export function upsertAgent(name: string, nodeId: string, binary: string, args: string[], description?: string, capabilities?: string[], contextAware?: boolean): void {
-  // Keyed on (name, node_id) — prevents cross-worker agent name hijacking
+  const def: AgentDefinition = { binary, args, description: description ?? '', capabilities: capabilities ?? [], contextAware: contextAware !== false };
   db.prepare(`DELETE FROM agents WHERE name = ? AND node_id = ?`).run(name, nodeId);
+  insertDeclaredAgent(nodeId, name, def, true);
+}
+
+export function insertDeclaredAgent(nodeId: string, name: string, def: AgentDefinition, approved: boolean): void {
+  const hash = definitionHash(def);
   db.prepare(
-    `INSERT INTO agents (name, node_id, binary, args_json, description, capabilities, context_aware) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(name, nodeId, binary, JSON.stringify(args), description ?? '', JSON.stringify(capabilities ?? []), contextAware === false ? 0 : 1);
+    `INSERT INTO agents (name, node_id, binary, args_json, description, capabilities, context_aware, definition_hash, approved_hash, approved_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    name, nodeId, def.binary, JSON.stringify(def.args), def.description, JSON.stringify(def.capabilities),
+    def.contextAware ? 1 : 0, hash, approved ? hash : '', approved ? definitionJson(def) : '',
+  );
+}
+
+/**
+ * Store a newly declared definition on an existing row, keeping id,
+ * created_at and (unless resetTrust) the trusted flag. With approve=true the
+ * definition is pinned as approved; otherwise the row becomes quarantined
+ * while its previous approved_hash/approved_json are kept for the review diff.
+ */
+export function updateDeclaredAgent(id: number, def: AgentDefinition, opts: { approve: boolean; resetTrust: boolean }): void {
+  const hash = definitionHash(def);
+  const sets = [
+    'binary = ?', 'args_json = ?', 'description = ?', 'capabilities = ?', 'context_aware = ?', 'definition_hash = ?',
+  ];
+  const values: unknown[] = [def.binary, JSON.stringify(def.args), def.description, JSON.stringify(def.capabilities), def.contextAware ? 1 : 0, hash];
+  if (opts.approve) { sets.push('approved_hash = ?', 'approved_json = ?'); values.push(hash, definitionJson(def)); }
+  if (opts.resetTrust) sets.push('trusted = 0');
+  values.push(id);
+  db.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function deleteAgentById(id: number): void {
+  db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+}
+
+/** All agents of a node regardless of review state. Declaration handling only. */
+export function getAgentsByNodeIdAnyState(nodeId: string): AgentRow[] {
+  return db.prepare(`SELECT * FROM agents WHERE node_id = ?`).all(nodeId) as AgentRow[];
+}
+
+/** Agents whose current definition differs from the approved one. */
+export function getPendingAgents(): AgentRow[] {
+  return db.prepare(`SELECT * FROM agents WHERE NOT (${APPROVED}) ORDER BY node_id, name`).all() as AgentRow[];
+}
+
+export function getPendingAgentById(id: number): AgentRow | undefined {
+  return db.prepare(`SELECT * FROM agents WHERE id = ? AND NOT (${APPROVED})`).get(id) as AgentRow | undefined;
+}
+
+/** Approve the current definition of a quarantined agent. */
+export function approveAgentDefinition(id: number): boolean {
+  const row = db.prepare(`SELECT * FROM agents WHERE id = ?`).get(id) as AgentRow | undefined;
+  if (!row || row.definition_hash === row.approved_hash) return false;
+  db.prepare(`UPDATE agents SET approved_hash = definition_hash, approved_json = ? WHERE id = ?`)
+    .run(definitionJson(rowDefinition(row)), id);
+  return true;
 }
 
 export function deleteAgentsByNodeId(nodeId: string): void {
@@ -303,7 +412,7 @@ export function deleteAgentsByNodeId(nodeId: string): void {
 }
 
 export function getAgentsByNodeId(nodeId: string): AgentRow[] {
-  return db.prepare(`SELECT * FROM agents WHERE node_id = ?`).all(nodeId) as AgentRow[];
+  return db.prepare(`SELECT * FROM agents WHERE node_id = ? AND ${APPROVED}`).all(nodeId) as AgentRow[];
 }
 
 /**
@@ -318,7 +427,7 @@ export function getAgentByName(name: string): AgentRow | undefined {
   return db.prepare(
     `SELECT a.* FROM agents a
      JOIN nodes n ON n.node_id = a.node_id
-     WHERE a.name = ? AND n.approved = 1
+     WHERE a.name = ? AND n.approved = 1 AND a.${APPROVED}
      ORDER BY a.created_at ASC
      LIMIT 1`
   ).get(name) as AgentRow | undefined;
@@ -333,7 +442,7 @@ export function getAgentByNameAndAlias(name: string, alias: string): AgentRow | 
   return db.prepare(
     `SELECT a.* FROM agents a
      JOIN nodes n ON n.node_id = a.node_id
-     WHERE a.name = ? AND n.alias = ? AND n.approved = 1
+     WHERE a.name = ? AND n.alias = ? AND n.approved = 1 AND a.${APPROVED}
      LIMIT 1`
   ).get(name, alias) as AgentRow | undefined;
 }
@@ -344,17 +453,12 @@ export function getAgentByNameAndAlias(name: string, alias: string): AgentRow | 
  */
 export function getAgentByNameAndNode(name: string, nodeId: string): AgentRow | undefined {
   return db.prepare(
-    `SELECT * FROM agents WHERE name = ? AND node_id = ? LIMIT 1`
+    `SELECT * FROM agents WHERE name = ? AND node_id = ? AND ${APPROVED} LIMIT 1`
   ).get(name, nodeId) as AgentRow | undefined;
 }
 
 export function getAllAgents(): AgentRow[] {
-  return db.prepare(`SELECT * FROM agents`).all() as AgentRow[];
-}
-
-export function deleteAgent(name: string): boolean {
-  const result = db.prepare(`DELETE FROM agents WHERE name = ?`).run(name);
-  return result.changes > 0;
+  return db.prepare(`SELECT * FROM agents WHERE ${APPROVED}`).all() as AgentRow[];
 }
 
 // Session operations
@@ -513,12 +617,15 @@ export function setApprovalMode(chatId: number, mode: ApprovalMode): void {
   db.prepare(`INSERT OR REPLACE INTO approval_config (chat_id, mode) VALUES (?, ?)`).run(chatId, mode);
 }
 
-// Agent trust (per-agent, skips approval when trusted)
-export function isAgentTrusted(agentName: string): boolean {
-  const row = db.prepare(`SELECT trusted FROM agents WHERE name = ?`).get(agentName) as { trusted: number } | undefined;
+// Agent trust (skips per-task approval). Scoped to (name, node): trusting
+// claude@laptop must not let a different machine's "claude" skip approval.
+export function isAgentTrusted(agentName: string, nodeId: string): boolean {
+  const row = db.prepare(
+    `SELECT trusted FROM agents WHERE name = ? AND node_id = ? AND ${APPROVED}`
+  ).get(agentName, nodeId) as { trusted: number } | undefined;
   return row?.trusted === 1;
 }
 
-export function setAgentTrusted(agentName: string, trusted: boolean): void {
-  db.prepare(`UPDATE agents SET trusted = ? WHERE name = ?`).run(trusted ? 1 : 0, agentName);
+export function setAgentTrusted(agentName: string, nodeId: string, trusted: boolean): void {
+  db.prepare(`UPDATE agents SET trusted = ? WHERE name = ? AND node_id = ?`).run(trusted ? 1 : 0, agentName, nodeId);
 }

@@ -125,6 +125,7 @@ anyagent> events watch
 | `READY_ALLOW_EMPTY` | unset | Set `=1` so `/ready` returns 200 with no workers (bootstrap). |
 | `AUDIT_NETWORK` | unset | Log every outbound connection to `network.log`. |
 | `AIRGAP` | unset | Refuse non-loopback outbound connections. Fails fast if `BOT_TOKEN` is set. |
+| `AGENT_REVIEW` | `changes` | Quarantine agents whose definition changed until approved with `review`. `all` also quarantines new agents; `off` disables pinning. |
 | `LOG_MAX_BYTES` | `10485760` | Rotation threshold for `hub.log`. |
 | `LOG_MAX_FILES` | `5` | How many rotated files to keep. |
 

@@ -104,7 +104,13 @@ export interface AgentRow {
   description: string;
   capabilities: string; // JSON-encoded string[] (v2)
   context_aware: number; // 0 or 1, default 1 (v2)
+  trusted: number; // 0 or 1 — skip per-task approval for this (name, node)
   created_at: string;
+  // Definition pinning (AR-3). The agent is usable only while
+  // definition_hash === approved_hash; otherwise it is quarantined for review.
+  definition_hash: string;
+  approved_hash: string;
+  approved_json: string; // JSON of the last approved definition, for review diffs
 }
 
 // Task row (v2)

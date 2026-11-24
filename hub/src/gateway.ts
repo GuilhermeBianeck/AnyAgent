@@ -584,6 +584,7 @@ async function handleMessage(
         accepted: outcome.accepted,
         ...(outcome.rejected.length ? { rejected: outcome.rejected } : {}),
         ...(outcome.modified.length ? { sanitized: outcome.modified } : {}),
+        ...(outcome.pendingReview.length ? { pendingReview: outcome.pendingReview } : {}),
       }));
       for (const cb of agentChangeCallbacks) cb();
       break;

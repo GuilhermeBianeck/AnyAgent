@@ -7,8 +7,10 @@ import {
   getActiveSessionByChatId, clearActiveSession, sendTtyInput,
   setDefaultAgent, getDefaultAgent, clearDefaultAgent,
   getApprovalMode, setApprovalMode, purgeTasksByChatId,
-  getActiveSession,
+  getActiveSession, resolveTaskAgent,
+  listPendingReviews, approvePendingAgent, type PendingReview,
 } from './manager.js';
+import { onEvent } from './events.js';
 import { randomBytes } from 'crypto';
 import {
   getAgentByName, getAgentByNameAndAlias, insertTask, updateTaskStatus, getRunningTasksByNodeId,
@@ -372,6 +374,7 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       '/context — Manage persistent operator context\n' +
       '/approve — Set task approval mode\n' +
       '/revoke — Revoke a paired worker\n' +
+      '/review — Agents quarantined after a definition change\n' +
       '/purge — Delete all task history'
     );
 
@@ -757,6 +760,50 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     }
   });
 
+  // --- /review — agents quarantined after their definition changed (AR-3) ---
+  function reviewHtml(r: PendingReview): string {
+    const head = `<b>${escapeHtml(r.name)}@${escapeHtml(r.nodeAlias)}</b> — ${r.before ? `changed: ${escapeHtml(r.changed.join(', '))}` : 'new agent'}`;
+    const show = (v: unknown) => escapeHtml((typeof v === 'string' ? v : JSON.stringify(v)).slice(0, 300));
+    const lines = r.changed.map(f =>
+      (r.before ? `  − ${f}: <code>${show(r.before[f])}</code>\n` : '') + `  + ${f}: <code>${show(r.after[f])}</code>`);
+    return [head, ...lines].join('\n');
+  }
+
+  bot.command('review', async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const pending = listPendingReviews();
+    if (pending.length === 0) {
+      await ctx.reply('No agents awaiting review.');
+      return;
+    }
+    for (const r of pending) {
+      await sendHtml(ctx, `🛡 <b>Awaiting review</b> (hidden from MCP and routing)\n${reviewHtml(r)}`, {
+        reply_markup: { inline_keyboard: [[{ text: `✅ Approve ${r.name}@${r.nodeAlias}`, callback_data: `agentok:${r.id}` }]] },
+      });
+    }
+  });
+
+  bot.callbackQuery(/^agentok:(\d+)$/, async (ctx) => {
+    if (!guardUser(ctx, allowedUserId)) return;
+    const approved = approvePendingAgent(parseInt(ctx.match[1], 10));
+    if (!approved) {
+      await ctx.answerCallbackQuery({ text: 'Already handled, or changed again — run /review.' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: 'Approved.' });
+    await ctx.editMessageText(`✅ Approved <b>${escapeHtml(approved.name)}@${escapeHtml(approved.nodeAlias)}</b>. Visible to MCP and routing again.`, { parse_mode: 'HTML' });
+  });
+
+  onEvent((evt) => {
+    if (evt.type !== 'agent.quarantined') return;
+    const r = listPendingReviews().find(p => p.nodeId === evt.node_id && p.name === evt.name);
+    if (!r) return;
+    bot.api.sendMessage(allowedUserId, `🛡 <b>Agent quarantined</b> — its definition changed since you last approved it. Hidden until reviewed.\n${reviewHtml(r)}`, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: `✅ Approve ${r.name}@${r.nodeAlias}`, callback_data: `agentok:${r.id}` }]] },
+    }).catch(() => {});
+  });
+
   // --- /approve ---
   bot.command('approve', async (ctx) => {
     if (!guardUser(ctx, allowedUserId)) return;
@@ -787,8 +834,8 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
     }
     await ctx.answerCallbackQuery({ text: 'Approved!' });
     await ctx.editMessageText(`✅ Approved: <i>${escapeHtml(task.intent.slice(0, 60))}</i>`, { parse_mode: 'HTML' });
-    // Now actually spawn the agent
-    const agent = task.agent_name ? getAgentByName(task.agent_name) : undefined;
+    // Now actually spawn the agent — on the machine that was approved.
+    const agent = resolveTaskAgent(task);
     if (!agent) {
       updateTaskStatus(taskId, 'failed', { error: 'Agent no longer exists' });
       return;
@@ -806,12 +853,12 @@ export function createBot(token: string, allowedUserId: number, config?: BotConf
       await ctx.answerCallbackQuery({ text: 'Task not found or already handled.' });
       return;
     }
-    // Trust the agent for future tasks
-    if (task.agent_name) setAgentTrusted(task.agent_name, true);
+    // Trust this machine's agent for future tasks (not same-named agents elsewhere)
+    if (task.agent_name && task.node_id) setAgentTrusted(task.agent_name, task.node_id, true);
     await ctx.answerCallbackQuery({ text: `Agent ${task.agent_name} trusted!` });
     await ctx.editMessageText(`🔓 Trusted <code>${escapeHtml(task.agent_name ?? '')}</code>. Approved: <i>${escapeHtml(task.intent.slice(0, 60))}</i>`, { parse_mode: 'HTML' });
     // Spawn
-    const agent = task.agent_name ? getAgentByName(task.agent_name) : undefined;
+    const agent = resolveTaskAgent(task);
     if (!agent) {
       updateTaskStatus(taskId, 'failed', { error: 'Agent no longer exists' });
       return;

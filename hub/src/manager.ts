@@ -6,7 +6,7 @@
 
 import { randomBytes } from 'crypto';
 import {
-  getAllNodes, getNodeById, getAgentByName, getAllAgents,
+  getAllNodes, getNodeById, getAgentByName, getAgentByNameAndNode, getAllAgents,
   nodeDisplayAlias,
   insertPairCode, insertTask, updateTaskStatus, getTask,
   getQueuedTasksByNodeId, getRecentTasksByChatId,
@@ -166,7 +166,7 @@ export function startAgentForTask(
     !wasAlreadyApproved &&
     ((approvalMode === 'always') ||
      (approvalMode === 'mcp' && routingMethod !== 'explicit' && routingMethod !== 'default'));
-  if (needsApproval && !dbIsAgentTrusted(agent.name)) {
+  if (needsApproval && !dbIsAgentTrusted(agent.name, agent.node_id)) {
     updateTaskStatus(taskId, 'pending_approval', { agent_name: agent.name, node_id: agent.node_id, routing_method: routingMethod });
     // Auto-deny after 5 minutes
     setTimeout(() => {
@@ -212,6 +212,18 @@ export function startAgentForTask(
   return result;
 }
 
+/**
+ * The agent a task is bound to. Once a task has a node_id it must stay on that
+ * machine — resolving by name alone could hand a task that was queued for, or
+ * approved on, claude@laptop to claude@gpu. Returns undefined if that agent is
+ * gone or quarantined.
+ */
+export function resolveTaskAgent(task: Pick<TaskRow, 'agent_name' | 'node_id'>): AgentRow | undefined {
+  if (!task.agent_name) return undefined;
+  if (task.node_id) return getAgentByNameAndNode(task.agent_name, task.node_id);
+  return getAgentByName(task.agent_name);
+}
+
 // --- Queue processing ---
 
 export function processNextQueued(nodeId: string): QueueProcessResult {
@@ -220,7 +232,7 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
     if (queued.length === 0) return { outcome: 'empty' };
 
     const next = queued[0];
-    const agent = next.agent_name ? getAgentByName(next.agent_name) : undefined;
+    const agent = resolveTaskAgent({ agent_name: next.agent_name, node_id: nodeId });
     if (!agent) {
       updateTaskStatus(next.task_id, 'failed', { error: 'Agent no longer available' });
       continue;
@@ -243,7 +255,7 @@ export function processNextQueued(nodeId: string): QueueProcessResult {
 
 // --- Approval ---
 
-export function handleApprovalDecision(taskId: string, decision: 'approve' | 'deny' | 'trust'): { ok: boolean; task?: TaskRow; agentName?: string } {
+export function handleApprovalDecision(taskId: string, decision: 'approve' | 'deny' | 'trust'): { ok: boolean; task?: TaskRow; agentName?: string; agent?: AgentRow } {
   const task = getTask(taskId);
   if (!task || task.status !== 'pending_approval') return { ok: false };
 
@@ -252,13 +264,14 @@ export function handleApprovalDecision(taskId: string, decision: 'approve' | 'de
     return { ok: true, task };
   }
 
-  if (decision === 'trust' && task.agent_name) {
-    dbSetAgentTrusted(task.agent_name, true);
+  if (decision === 'trust' && task.agent_name && task.node_id) {
+    dbSetAgentTrusted(task.agent_name, task.node_id, true);
   }
 
   // Reset to submitted so startAgentForTask can proceed past approval gate
   updateTaskStatus(taskId, 'submitted');
-  return { ok: true, task, agentName: task.agent_name ?? undefined };
+  // The operator approved THIS machine's agent — never re-resolve by name.
+  return { ok: true, task, agentName: task.agent_name ?? undefined, agent: resolveTaskAgent(task) };
 }
 
 // --- Pairing ---
@@ -348,3 +361,7 @@ export function setApprovalMode(chatId: number, mode: 'off' | 'mcp' | 'always'):
 }
 
 export { dbIsAgentTrusted as isAgentTrusted };
+
+// --- Agent definition review (AR-3) ---
+
+export { listPendingReviews, getPendingReview, approvePendingAgent, reviewMode, type PendingReview } from './declare.js';

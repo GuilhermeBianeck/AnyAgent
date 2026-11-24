@@ -225,6 +225,7 @@ anyagent> route fix the authentication bug
 | `approve [off\|mcp\|always]` | Approval mode |
 | `context [set\|add\|clear]` | Operator context |
 | `revoke <node_id>` | Revoke worker |
+| `review [approve <#\|name@alias>]` | Agents quarantined after their definition changed; approve one |
 | `purge` | Clear task history |
 | `events [watch]` | Recent worker/task events, or tail live |
 | `net` | Recent outbound connections (requires `AUDIT_NETWORK=1`) |
@@ -234,7 +235,7 @@ Any unrecognized text is forwarded as input to the active agent session.
 
 ### Telegram (optional — set `BOT_TOKEN`)
 
-Same commands with `/` prefix: `/pair`, `/workers`, `/nodes`, `/agents`, `/call`, `/tasks`, `/history`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/purge`, `/status`, `/switch`.
+Same commands with `/` prefix: `/pair`, `/workers`, `/nodes`, `/agents`, `/call`, `/tasks`, `/history`, `/stop`, `/default`, `/approve`, `/context`, `/revoke`, `/review`, `/purge`, `/status`, `/switch`.
 
 `/agents` and `/nodes` group by machine (each worker has an **alias** derived from its `WORKER_NAME` — `Spot.local` → `spot`). `/call <name>` lets the hub pick (oldest online pairing wins); `/call <name>@<alias>` targets a specific machine when multiple workers declare the same agent name.
 
@@ -257,6 +258,14 @@ Plus: inline buttons for pairing approval, task approval/deny/trust, retry, canc
 | `SESSION_TIMEOUT_MS` | `1800000` | Inactivity timeout (30 min) |
 | `MAX_QUEUE_DEPTH` | `3` | Max queued tasks per worker |
 | `AUTO_APPROVE_LOOPBACK` | — | Set `=1` to auto-approve pair requests from `127.0.0.1`/`::1`. Used by `quickstart.sh`; ignored for non-loopback connections. |
+| `AGENT_REVIEW` | `changes` | Agent definition pinning. `changes`: an agent whose binary, args, description or capabilities change is hidden until you approve it with `review`. `all`: new agents need review too. `off`: accept changes automatically. |
+
+### Agent definition pinning
+
+Agent descriptions become MCP tool descriptions that every connected client feeds to its model, so a compromised worker could use them for prompt injection ("tool poisoning"). The hub defends in two layers:
+
+1. **Sanitization.** Invisible characters (zero-width, bidi, Unicode tag characters), HTML-like tags such as `<IMPORTANT>`, and oversized fields are stripped when a worker declares its agents. Invalid names or binaries are rejected, and the worker's log says why.
+2. **Pinning.** Each agent's definition is hashed the first time the hub sees it. If a worker later declares something different, that agent is quarantined: it disappears from MCP, routing and `/agents`, and you get a notice in the CLI (and Telegram). `review` shows a before/after diff. If the change looks wrong, `revoke` the worker instead of approving.
 
 ### Worker
 
