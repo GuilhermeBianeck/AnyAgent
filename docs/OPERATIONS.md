@@ -100,6 +100,10 @@ readinessProbe:
 
 - **Hub log:** `hub/logs/hub.log` — JSON lines, rotated at 10MB × 5 files.
   Mirrors everything sent to `console.log` / `console.warn` / `console.error`.
+  Readable by the hub's user only (mode 0600). New MCP tokens and pairing
+  codes are shown in the terminal but never written to it, and MCP tokens,
+  Telegram bot tokens and the `MCP_TOKEN` / `WS_SECRET` / `BOT_TOKEN` values
+  are masked if they appear in a logged message.
 - **Event log:** `hub/logs/events.log` — JSON lines, worker state transitions
   (`worker.online`, `worker.offline`, `worker.heartbeat_miss`, `worker.flapping`,
   `task.complete`, `task.failed`, `hub.started`), plus agent security events

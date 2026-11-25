@@ -27,7 +27,7 @@ import { createToken, listTokens, revokeToken, TokenError } from './tokens.js';
 import { mcpServerRunning } from './mcp.js';
 import { metricsEnabled } from './metrics.js';
 import { recentConnections, auditEnabled, airgapEnabled } from './netlog.js';
-import { logPath } from './logger.js';
+import { logPath, printSecret } from './logger.js';
 
 const BOLD = '\x1b[1m';
 const GREEN = '\x1b[32m';
@@ -212,8 +212,9 @@ ${BOLD}Config${RESET}
 
       case 'pair': {
         const { code } = generatePairCode();
-        console.log(`${YELLOW}Pairing code:${RESET} ${BOLD}${code}${RESET}`);
-        console.log(`${DIM}Expires in 10 minutes. Set PAIR_CODE=${code} on your worker.${RESET}`);
+        // printSecret: shown in the terminal, never written to hub.log.
+        printSecret(`${YELLOW}Pairing code:${RESET} ${BOLD}${code}${RESET}`);
+        printSecret(`${DIM}Expires in 10 minutes. Set PAIR_CODE=${code} on your worker.${RESET}`);
         break;
       }
 
@@ -546,7 +547,10 @@ ${BOLD}Config${RESET}
           try {
             const { token, scope } = createToken(label, { agents, readonly });
             const what = scope.readonly ? 'read-only' : scope.agents === '*' ? 'all agents' : scope.agents.join(', ');
-            console.log(`${GREEN}✓${RESET} Token ${BOLD}${label}${RESET} (${what}). Copy it now — it is not shown again:\n\n  ${BOLD}${token}${RESET}\n`);
+            console.log(`${GREEN}✓${RESET} Token ${BOLD}${label}${RESET} (${what}). Copy it now — it is not shown again:`);
+            // printSecret: shown in the terminal, never written to hub.log
+            // (only the token's SHA-256 is stored anywhere).
+            printSecret(`\n  ${BOLD}${token}${RESET}\n`);
             console.log(`${DIM}Use it as: Authorization: Bearer <token>${RESET}`);
             if (!mcpServerRunning()) console.log(`${YELLOW}The MCP server is not running. Restart the hub to enable it.${RESET}`);
           } catch (err) {
